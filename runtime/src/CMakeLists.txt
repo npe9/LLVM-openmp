@@ -51,6 +51,41 @@ if(${LIBOMP_USE_HWLOC})
   include_directories(${LIBOMP_HWLOC_INSTALL_DIR}/include)
 endif()
 
+# Check for Lithe support
+option(LIBOMP_USE_LITHE "Use Lithe threading library" OFF)
+if(LIBOMP_USE_LITHE)
+  # Check for Lithe headers
+  find_path(LITHE_INCLUDE_DIR lithe/lithe.h
+    PATHS
+    /Users/npe/src/scythe/lithe/include
+    /usr/local/include
+    /usr/include
+    NO_DEFAULT_PATH
+  )
+  
+  # Check for Lithe library
+  find_library(LITHE_LIBRARY
+    NAMES lithe
+    PATHS
+    /Users/npe/src/scythe/lithe/lib
+    /usr/local/lib
+    /usr/lib
+    NO_DEFAULT_PATH
+  )
+  
+  if(LITHE_INCLUDE_DIR AND LITHE_LIBRARY)
+    set(LIBOMP_HAVE_LITHE TRUE)
+    include_directories(${LITHE_INCLUDE_DIR})
+    message(STATUS "LIBOMP: Using Lithe threading library -- YES")
+  else()
+    set(LIBOMP_HAVE_LITHE FALSE)
+    message(STATUS "LIBOMP: Using Lithe threading library -- NO (missing headers or library)")
+  endif()
+else()
+  set(LIBOMP_HAVE_LITHE FALSE)
+  message(STATUS "LIBOMP: Using Lithe threading library -- NO (disabled)")
+endif()
+
 # Getting correct source files to build library
 set(LIBOMP_CFILES)
 set(LIBOMP_CXXFILES)
@@ -120,6 +155,13 @@ libomp_append(LIBOMP_CXXFILES kmp_ftn_extra.cpp)
 libomp_append(LIBOMP_CXXFILES kmp_version.cpp)
 libomp_append(LIBOMP_CXXFILES ompt-general.cpp IF_TRUE LIBOMP_OMPT_SUPPORT)
 libomp_append(LIBOMP_CXXFILES tsan_annotations.cpp IF_TRUE LIBOMP_TSAN_SUPPORT)
+
+# Add Lithe-specific files if Lithe support is enabled
+if(LIBOMP_HAVE_LITHE)
+  libomp_append(LIBOMP_CXXFILES lithe/kmp_lithe.cpp)
+  libomp_append(LIBOMP_CXXFILES lithe/kmp_lithe_entry.cpp)
+  add_definitions(-DLIBOMP_USE_LITHE)
+endif()
 
 set(LIBOMP_SOURCE_FILES ${LIBOMP_CFILES} ${LIBOMP_CXXFILES} ${LIBOMP_ASMFILES})
 # For Windows, there is a resource file (.rc -> .res) that is also compiled
