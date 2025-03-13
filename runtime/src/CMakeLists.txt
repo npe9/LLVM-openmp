@@ -89,6 +89,16 @@ else()
     libomp_append(LIBOMP_CXXFILES z_Windows_NT_util.cpp)
     libomp_append(LIBOMP_CXXFILES z_Windows_NT-586_util.cpp)
     libomp_append(LIBOMP_ASMFILES z_Windows_NT-586_asm.asm) # Windows assembly file
+  elseif(APPLE)
+    # macOS specific files
+    libomp_append(LIBOMP_CXXFILES z_Linux_util.cpp)
+    libomp_append(LIBOMP_CXXFILES kmp_gsupport.cpp)
+    # Use appropriate assembly file for macOS/Darwin
+    if("${LIBOMP_ARCH}" STREQUAL "aarch64")
+      libomp_append(LIBOMP_ASMFILES z_Darwin_asm.S) # macOS ARM64 assembly file
+    else()
+      libomp_append(LIBOMP_ASMFILES z_Linux_asm.S) # Unix assembly file for other architectures
+    endif()
   else()
     # Unix specific files
     libomp_append(LIBOMP_CXXFILES z_Linux_util.cpp)
