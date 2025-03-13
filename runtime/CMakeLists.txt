@@ -137,6 +137,15 @@ set(LIBOMP_USE_HWLOC FALSE CACHE BOOL
 set(LIBOMP_HWLOC_INSTALL_DIR /usr/local CACHE PATH
   "Install path for hwloc library")
 
+# Threading portability layer support
+set(LIBOMP_USE_THREADING_LAYER FALSE CACHE BOOL
+  "Use threading portability layer?")
+
+# Select threading backend (pthreads or lithe)
+set(LIBOMP_THREADING_BACKEND "pthreads" CACHE STRING
+  "Threading backend to use (pthreads or lithe)")
+set_property(CACHE LIBOMP_THREADING_BACKEND PROPERTY STRINGS pthreads lithe)
+
 # Get the build number from kmp_version.cpp
 libomp_get_build_number("${CMAKE_CURRENT_SOURCE_DIR}" LIBOMP_VERSION_BUILD)
 math(EXPR LIBOMP_VERSION_BUILD_YEAR "${LIBOMP_VERSION_BUILD}/10000")
@@ -391,6 +400,25 @@ if(${OPENMP_STANDALONE_BUILD})
   libomp_say("Use quad precision   -- ${LIBOMP_USE_QUAD_PRECISION}")
   libomp_say("Use TSAN-support     -- ${LIBOMP_TSAN_SUPPORT}")
   libomp_say("Use Hwloc library    -- ${LIBOMP_USE_HWLOC}")
+  libomp_say("Use Threading Layer  -- ${LIBOMP_USE_THREADING_LAYER}")
+  if(${LIBOMP_USE_THREADING_LAYER})
+    libomp_say("Threading Backend   -- ${LIBOMP_THREADING_BACKEND}")
+  endif()
+endif()
+
+# Find parlib if threading layer is enabled
+if(${LIBOMP_USE_THREADING_LAYER})
+  # Set include directories for parlib
+  include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../parlib/include)
+  
+  # Add compile definitions based on the selected backend
+  if(${LIBOMP_THREADING_BACKEND} STREQUAL "pthreads")
+    add_definitions(-DPARLIB_USE_PTHREADS)
+  elseif(${LIBOMP_THREADING_BACKEND} STREQUAL "lithe")
+    add_definitions(-DPARLIB_USE_LITHE)
+    # Add lithe include directories
+    include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../lithe/include)
+  endif()
 endif()
 
 add_subdirectory(src)
