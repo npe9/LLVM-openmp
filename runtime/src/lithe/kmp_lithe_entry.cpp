@@ -34,7 +34,7 @@ __kmp_lithe_initialize(void) {
     __kmp_lithe_scheduler_init(&__kmp_lithe_scheduler, __kmp_threads[0]);
     
     // Enter the Lithe scheduler
-    lithe_sched_enter((lithe_sched_t *)&__kmp_lithe_scheduler);
+    __kmp_lithe_scheduler.sched.enter(&__kmp_lithe_scheduler.sched);
     
     __kmp_lithe_initialized = 1;
     
@@ -49,7 +49,7 @@ __kmp_lithe_finalize(void) {
     }
     
     // Exit the Lithe scheduler
-    lithe_sched_exit();
+    __kmp_lithe_scheduler.sched.exit(&__kmp_lithe_scheduler.sched);
     
     // Finalize the Lithe scheduler for OpenMP
     __kmp_lithe_scheduler_finalize(&__kmp_lithe_scheduler);

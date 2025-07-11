@@ -42,7 +42,7 @@ static void kmp_lithe_worker_entry(void *arg) {
     KMP_INFORM(LitheWorkerStarted, "KMP_LITHE", gtid);
     
     // Enter the OpenMP worker loop
-    __kmp_launch_worker(gtid);
+    __kmp_launch_thread(thread);
     
     KMP_INFORM(LitheWorkerFinished, "KMP_LITHE", gtid);
 }
@@ -120,7 +120,7 @@ int __kmp_lithe_create_worker(kmp_lithe_scheduler_t *scheduler, int gtid) {
     }
     
     // Allocate stack for the context
-    void *stack = malloc(KMP_DEFAULT_STACK_SIZE);
+    void *stack = malloc(KMP_DEFAULT_STKSIZE);
     if (!stack) {
         free(context);
         KMP_FATAL(MemoryAllocFailed);
@@ -128,8 +128,8 @@ int __kmp_lithe_create_worker(kmp_lithe_scheduler_t *scheduler, int gtid) {
     }
     
     // Initialize the context
-    context->stack = stack;
-    context->stack_size = KMP_DEFAULT_STACK_SIZE;
+    context->stack.bottom = stack;
+    context->stack.size = KMP_DEFAULT_STKSIZE;
     lithe_context_init(context, kmp_lithe_worker_entry, (void*)(size_t)gtid);
     
     // Add the context to our list of workers
@@ -174,7 +174,7 @@ void __kmp_lithe_runtime_finalize(void) {
 }
 
 // Lithe scheduler function implementations
-static void lithe_hart_request(lithe_sched_t *__this, lithe_sched_t *child, int h) {
+void lithe_hart_request(lithe_sched_t *__this, lithe_sched_t *child, int h) {
     kmp_lithe_scheduler_t *scheduler = (kmp_lithe_scheduler_t *)__this;
     
     KMP_INFORM(LitheHartRequest, "KMP_LITHE", h);
@@ -184,7 +184,7 @@ static void lithe_hart_request(lithe_sched_t *__this, lithe_sched_t *child, int 
     KMP_INFORM(LitheNestedParallelismNotSupported, "KMP_LITHE");
 }
 
-static void lithe_hart_enter(lithe_sched_t *__this) {
+void lithe_hart_enter(lithe_sched_t *__this) {
     kmp_lithe_scheduler_t *scheduler = (kmp_lithe_scheduler_t *)__this;
     
     // Increment the number of granted harts
@@ -202,7 +202,7 @@ static void lithe_hart_enter(lithe_sched_t *__this) {
     }
 }
 
-static void lithe_hart_return(lithe_sched_t *__this, lithe_sched_t *child) {
+void lithe_hart_return(lithe_sched_t *__this, lithe_sched_t *child) {
     kmp_lithe_scheduler_t *scheduler = (kmp_lithe_scheduler_t *)__this;
     
     KMP_INFORM(LitheHartReturn, "KMP_LITHE");
@@ -211,7 +211,7 @@ static void lithe_hart_return(lithe_sched_t *__this, lithe_sched_t *child) {
     // For now, we don't support nested parallelism with Lithe
 }
 
-static void lithe_sched_enter(lithe_sched_t *__this) {
+void lithe_sched_enter(lithe_sched_t *__this) {
     kmp_lithe_scheduler_t *scheduler = (kmp_lithe_scheduler_t *)__this;
     
     KMP_INFORM(LitheSchedEnter, "KMP_LITHE");
@@ -220,7 +220,7 @@ static void lithe_sched_enter(lithe_sched_t *__this) {
     // The root thread is already running, so we don't need to do anything here
 }
 
-static void lithe_sched_exit(lithe_sched_t *__this) {
+void lithe_sched_exit(lithe_sched_t *__this) {
     kmp_lithe_scheduler_t *scheduler = (kmp_lithe_scheduler_t *)__this;
     
     KMP_INFORM(LitheSchedExit, "KMP_LITHE");
@@ -229,7 +229,7 @@ static void lithe_sched_exit(lithe_sched_t *__this) {
     // We should clean up any remaining worker threads
 }
 
-static void lithe_child_enter(lithe_sched_t *__this, lithe_sched_t *child) {
+void lithe_child_enter(lithe_sched_t *__this, lithe_sched_t *child) {
     kmp_lithe_scheduler_t *scheduler = (kmp_lithe_scheduler_t *)__this;
     
     KMP_INFORM(LitheChildEnter, "KMP_LITHE");
@@ -238,7 +238,7 @@ static void lithe_child_enter(lithe_sched_t *__this, lithe_sched_t *child) {
     // For now, we don't support nested parallelism with Lithe
 }
 
-static void lithe_child_exit(lithe_sched_t *__this, lithe_sched_t *child) {
+void lithe_child_exit(lithe_sched_t *__this, lithe_sched_t *child) {
     kmp_lithe_scheduler_t *scheduler = (kmp_lithe_scheduler_t *)__this;
     
     KMP_INFORM(LitheChildExit, "KMP_LITHE");
@@ -247,7 +247,7 @@ static void lithe_child_exit(lithe_sched_t *__this, lithe_sched_t *child) {
     // For now, we don't support nested parallelism with Lithe
 }
 
-static void lithe_context_block(lithe_sched_t *__this, lithe_context_t *context) {
+void lithe_context_block(lithe_sched_t *__this, lithe_context_t *context) {
     kmp_lithe_scheduler_t *scheduler = (kmp_lithe_scheduler_t *)__this;
     
     KMP_INFORM(LitheContextBlock, "KMP_LITHE");
@@ -256,7 +256,7 @@ static void lithe_context_block(lithe_sched_t *__this, lithe_context_t *context)
     // We should try to schedule another worker if available
 }
 
-static void lithe_context_unblock(lithe_sched_t *__this, lithe_context_t *context) {
+void lithe_context_unblock(lithe_sched_t *__this, lithe_context_t *context) {
     kmp_lithe_scheduler_t *scheduler = (kmp_lithe_scheduler_t *)__this;
     
     KMP_INFORM(LitheContextUnblock, "KMP_LITHE");
@@ -265,7 +265,7 @@ static void lithe_context_unblock(lithe_sched_t *__this, lithe_context_t *contex
     // We should add the context back to our runnable queue
 }
 
-static void lithe_context_yield(lithe_sched_t *__this, lithe_context_t *context) {
+void lithe_context_yield(lithe_sched_t *__this, lithe_context_t *context) {
     kmp_lithe_scheduler_t *scheduler = (kmp_lithe_scheduler_t *)__this;
     
     KMP_INFORM(LitheContextYield, "KMP_LITHE");
@@ -274,7 +274,7 @@ static void lithe_context_yield(lithe_sched_t *__this, lithe_context_t *context)
     // We should try to schedule another worker if available
 }
 
-static void lithe_context_exit(lithe_sched_t *__this, lithe_context_t *context) {
+void lithe_context_exit(lithe_sched_t *__this, lithe_context_t *context) {
     kmp_lithe_scheduler_t *scheduler = (kmp_lithe_scheduler_t *)__this;
     
     KMP_INFORM(LitheContextExit, "KMP_LITHE");

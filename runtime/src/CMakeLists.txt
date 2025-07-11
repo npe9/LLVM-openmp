@@ -228,6 +228,11 @@ endif()
 libomp_get_libflags(LIBOMP_CONFIGURED_LIBFLAGS)
 target_link_libraries(omp ${LIBOMP_CONFIGURED_LIBFLAGS} ${CMAKE_DL_LIBS})
 
+# Add Lithe library if Lithe support is enabled
+if(LIBOMP_HAVE_LITHE)
+  target_link_libraries(omp PRIVATE ithe)
+endif()
+
 # Create *.inc before compiling any sources
 # objects depend on : .inc files
 add_custom_target(libomp-needed-headers DEPENDS kmp_i18n_id.inc kmp_i18n_default.inc)
