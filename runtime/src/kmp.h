@@ -111,6 +111,10 @@ class kmp_stats_list;
 #endif
 #include "kmp_i18n.h"
 
+#ifdef LIBOMP_USE_LITHE
+#include "lithe/kmp_lithe.h"
+#endif
+
 #define KMP_HANDLE_SIGNALS (KMP_OS_UNIX || KMP_OS_WINDOWS)
 
 #include "kmp_wrapper_malloc.h"
@@ -1938,18 +1942,22 @@ typedef struct kmp_win32_cond {
 union KMP_ALIGN_CACHE kmp_cond_union {
   double c_align;
   char c_pad[CACHE_LINE];
-  pthread_cond_t c_cond;
+  KMP_COND_T c_cond;
 };
 
+#ifndef KMP_COND_ALIGN_T_DEFINED
 typedef union kmp_cond_union kmp_cond_align_t;
+#endif
 
 union KMP_ALIGN_CACHE kmp_mutex_union {
   double m_align;
   char m_pad[CACHE_LINE];
-  pthread_mutex_t m_mutex;
+  KMP_MUTEX_T m_mutex;
 };
 
+#ifndef KMP_MUTEX_ALIGN_T_DEFINED
 typedef union kmp_mutex_union kmp_mutex_align_t;
+#endif
 
 #endif /* KMP_OS_UNIX */
 
@@ -2879,6 +2887,15 @@ extern enum sched_type __kmp_static; /* default static scheduling method */
 extern enum sched_type __kmp_guided; /* default guided scheduling method */
 extern enum sched_type __kmp_auto; /* default auto scheduling method */
 extern int __kmp_chunk; /* default runtime chunk size */
+
+#ifdef PARLIB_USE_LITHE
+// Lithe integration functions
+extern "C" void __kmp_lithe_initialize(void);
+extern "C" void __kmp_lithe_finalize(void);
+extern "C" int __kmp_lithe_fork_call(int argc, microtask_t microtask, int gtid, void *wrapper_argv[]);
+extern "C" void __kmp_lithe_join_call(int gtid);
+extern "C" kmp_critical_name *__kmp_lithe_get_unnamed_critical_addr(void);
+#endif
 
 extern size_t __kmp_stksize; /* stack size per thread         */
 #if KMP_USE_MONITOR

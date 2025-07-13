@@ -2,7 +2,11 @@
  * kmp_lithe_entry.cpp - Entry points for OpenMP runtime integration with Lithe
  */
 
+#ifdef __cplusplus
+#define typeof __typeof__
+#endif
 #include "kmp_lithe.h"
+#include "kmp.h"  // For OpenMP types and declarations
 #include "kmp_i18n.h"
 #include "kmp_io.h"
 
@@ -12,14 +16,6 @@ static kmp_lithe_scheduler_t __kmp_lithe_scheduler;
 // Flag to indicate if Lithe integration is initialized
 static int __kmp_lithe_initialized = 0;
 
-// Entry point for microtask invocation via Lithe
-// This is the function that will be called by the assembly stub
-extern "C" void
-__kmp_invoke_microtask(microtask_t pkfn, int gtid, int tid, int argc, void *p_argv[]) {
-    // Call the microtask function
-    (*pkfn)(&gtid, &tid, argc, p_argv);
-}
-
 // Initialize the OpenMP runtime with Lithe integration
 extern "C" void
 __kmp_lithe_initialize(void) {
@@ -27,14 +23,18 @@ __kmp_lithe_initialize(void) {
         return;
     }
     
+    // At this point, parallel initialization is complete and __kmp_threads[0] is guaranteed to be valid
+    KMP_ASSERT(__kmp_threads != NULL);
+    KMP_ASSERT(__kmp_threads[0] != NULL);
+    
     // Initialize Lithe runtime
     __kmp_lithe_runtime_initialize();
     
     // Initialize the Lithe scheduler for OpenMP
-    __kmp_lithe_scheduler_init(&__kmp_lithe_scheduler, __kmp_threads[0]);
+    __kmp_lithe_scheduler_init(&__kmp_lithe_scheduler, (void*)__kmp_threads[0]);
     
     // Enter the Lithe scheduler
-    __kmp_lithe_scheduler.sched.enter(&__kmp_lithe_scheduler.sched);
+    lithe_sched_enter(&__kmp_lithe_scheduler.sched);
     
     __kmp_lithe_initialized = 1;
     
@@ -49,7 +49,7 @@ __kmp_lithe_finalize(void) {
     }
     
     // Exit the Lithe scheduler
-    __kmp_lithe_scheduler.sched.exit(&__kmp_lithe_scheduler.sched);
+    lithe_sched_exit();
     
     // Finalize the Lithe scheduler for OpenMP
     __kmp_lithe_scheduler_finalize(&__kmp_lithe_scheduler);
@@ -65,7 +65,12 @@ __kmp_lithe_finalize(void) {
 // Create worker threads using Lithe
 extern "C" int
 __kmp_lithe_fork_call(int argc, microtask_t microtask, int gtid, void *wrapper_argv[]) {
-    int nthreads = __kmp_threads[gtid]->th.th_team->t.t_nproc;
+    // Ensure lithe is initialized (should already be done by now)
+    KMP_ASSERT(__kmp_lithe_initialized);
+    
+    kmp_info_t *master_th = __kmp_threads[gtid];
+    kmp_team_t *team = master_th->th.th_team;
+    int nthreads = team->t.t_nproc;
     
     KMP_INFORM(LitheForkCall, "KMP_LITHE", nthreads);
     
@@ -74,15 +79,14 @@ __kmp_lithe_fork_call(int argc, microtask_t microtask, int gtid, void *wrapper_a
     
     // Create worker threads using Lithe
     for (int i = 1; i < nthreads; i++) {
-        if (!__kmp_lithe_create_worker(&__kmp_lithe_scheduler, __kmp_threads[gtid]->th.th_team->t.t_threads[i]->th.th_info.ds.ds_gtid)) {
+        if (!__kmp_lithe_create_worker(&__kmp_lithe_scheduler, team->t.t_threads[i]->th.th_info.ds.ds_gtid)) {
             KMP_WARNING(CantCreateWorkerThread);
         }
     }
     
-    // Execute the microtask on the master thread
-    (*microtask)(&gtid, &gtid, argc, wrapper_argv);
-    
-    return 1;
+    // Invoke the microtask for the master thread
+    KMP_ASSERT(wrapper_argv != NULL);
+    return __kmp_invoke_microtask(microtask, gtid, 0, argc, wrapper_argv, nullptr);
 }
 
 // Join worker threads using Lithe
@@ -106,3 +110,4 @@ __kmp_lithe_get_unnamed_critical_addr(void) {
     static kmp_critical_name __kmp_unnamed_critical_addr;
     return &__kmp_unnamed_critical_addr;
 }
+

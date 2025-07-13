@@ -296,6 +296,15 @@ void __kmpc_fork_call(ident_t *loc, kmp_int32 argc, kmpc_micro microtask, ...) {
 #if INCLUDE_SSC_MARKS
     SSC_MARK_FORKING();
 #endif
+#ifdef PARLIB_USE_LITHE
+    // Create wrapper_argv array from va_list
+    void **wrapper_argv = (void **)__kmp_allocate(argc * sizeof(void *));
+    for (int i = 0; i < argc; i++) {
+      wrapper_argv[i] = va_arg(ap, void *);
+    }
+    __kmp_lithe_fork_call(argc, VOLATILE_CAST(microtask_t) microtask, gtid, wrapper_argv);
+    __kmp_free(wrapper_argv);
+#else
     __kmp_fork_call(loc, gtid, fork_context_intel, argc,
                     VOLATILE_CAST(microtask_t) microtask, // "wrapped" task
                     VOLATILE_CAST(launch_t) __kmp_invoke_task_func,
@@ -306,15 +315,20 @@ void __kmpc_fork_call(ident_t *loc, kmp_int32 argc, kmpc_micro microtask, ...) {
                     ap
 #endif
                     );
+#endif
 #if INCLUDE_SSC_MARKS
     SSC_MARK_JOINING();
 #endif
+#ifdef PARLIB_USE_LITHE
+    __kmp_lithe_join_call(gtid);
+#else
     __kmp_join_call(loc, gtid
 #if OMPT_SUPPORT
                     ,
                     fork_context_intel
 #endif
                     );
+#endif
 
     va_end(ap);
   }
@@ -384,6 +398,10 @@ void __kmpc_fork_teams(ident_t *loc, kmp_int32 argc, kmpc_micro microtask,
   KMP_DEBUG_ASSERT(this_thr->th.th_teams_size.nteams >= 1);
   KMP_DEBUG_ASSERT(this_thr->th.th_teams_size.nth >= 1);
 
+#ifdef PARLIB_USE_LITHE
+  __kmp_lithe_fork_call(argc, VOLATILE_CAST(microtask_t) __kmp_teams_master, gtid, NULL);
+  __kmp_lithe_join_call(gtid);
+#else
   __kmp_fork_call(loc, gtid, fork_context_intel, argc,
                   VOLATILE_CAST(microtask_t)
                       __kmp_teams_master, // "wrapped" task
@@ -400,6 +418,7 @@ void __kmpc_fork_teams(ident_t *loc, kmp_int32 argc, kmpc_micro microtask,
                   fork_context_intel
 #endif
                   );
+#endif
 
   this_thr->th.th_teams_microtask = NULL;
   this_thr->th.th_teams_level = 0;

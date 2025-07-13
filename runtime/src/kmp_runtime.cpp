@@ -6457,6 +6457,11 @@ static void __kmp_do_serial_initialize(void) {
   __kmp_check_mic_type();
 #endif
 
+#ifdef PARLIB_USE_LITHE
+  // Lithe integration will be initialized after parallel initialization is complete
+  // to ensure __kmp_threads and __kmp_threads[0] are available
+#endif
+
 // Some global variable initialization moved here from kmp_env_initialize()
 #ifdef KMP_DEBUG
   kmp_diag = 0;
@@ -6863,6 +6868,13 @@ void __kmp_parallel_initialize(void) {
 
   /* we have finished parallel initialization */
   TCW_SYNC_4(__kmp_init_parallel, TRUE);
+
+#ifdef PARLIB_USE_LITHE
+  // Initialize lithe integration after parallel initialization is complete
+  // to ensure __kmp_threads and __kmp_threads[0] are available
+  extern void __kmp_lithe_initialize(void);
+  __kmp_lithe_initialize();
+#endif
 
   KMP_MB();
   KA_TRACE(10, ("__kmp_parallel_initialize: exit\n"));

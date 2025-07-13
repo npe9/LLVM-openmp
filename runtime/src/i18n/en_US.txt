@@ -425,6 +425,32 @@ AffHWSubsetManyTiles         "KMP_HW_SUBSET ignored: too many L2 Caches requeste
 AffHWSubsetManyProcs         "KMP_HW_SUBSET ignored: too many Procs requested."
 HierSchedInvalid             "Hierarchy ignored: unsupported level: %1$s."
 
+# Lithe integration messages
+LitheInitialized             "Lithe integration initialized for %1$s"
+LitheFinalized               "Lithe integration finalized for %1$s"
+LitheWorkerStarted           "Lithe worker thread %2$d started for %1$s"
+LitheWorkerFinished          "Lithe worker thread %2$d finished for %1$s"
+LitheSchedulerInitialized    "Lithe scheduler initialized for %1$s"
+LitheSchedulerFinalized      "Lithe scheduler finalized for %1$s"
+LitheRuntimeInitializing     "Lithe runtime initializing for %1$s"
+LitheRuntimeInitialized      "Lithe runtime initialized for %1$s"
+LitheRuntimeFinalized        "Lithe runtime finalized for %1$s"
+LitheHartRequest             "Lithe hart request for %1$s: %2$d harts"
+LitheHartEnter               "Lithe hart entered for %1$s: %2$d harts granted"
+LitheHartReturn              "Lithe hart returned for %1$s"
+LitheSchedEnter              "Lithe scheduler entered for %1$s"
+LitheSchedExit               "Lithe scheduler exited for %1$s"
+LitheChildEnter              "Lithe child scheduler entered for %1$s"
+LitheChildExit               "Lithe child scheduler exited for %1$s"
+LitheContextBlock            "Lithe context blocked for %1$s"
+LitheContextUnblock          "Lithe context unblocked for %1$s"
+LitheContextYield            "Lithe context yielded for %1$s"
+LitheContextExit             "Lithe context exited for %1$s"
+LitheForkCall                "Lithe fork call for %1$s: %2$d threads"
+LitheJoinCall                "Lithe join call for %1$s: thread %2$d"
+LitheNestedParallelismNotSupported "Lithe nested parallelism not supported for %1$s"
+CantCreateWorkerThread           "Cannot create worker thread"
+
 
 # --------------------------------------------------------------------------------------------------
 -*- HINTS -*-

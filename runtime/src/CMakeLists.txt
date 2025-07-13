@@ -51,39 +51,43 @@ if(${LIBOMP_USE_HWLOC})
   include_directories(${LIBOMP_HWLOC_INSTALL_DIR}/include)
 endif()
 
-# Check for Lithe support
-option(LIBOMP_USE_LITHE "Use Lithe threading library" OFF)
+# Set LITHE_ROOT and PARLIB_ROOT from environment or cache
+set(LITHE_ROOT $ENV{LITHE_ROOT} CACHE PATH "Root of Lithe" "/users/npe/src/lithe-docker/lithe")
+set(PARLIB_ROOT $ENV{PARLIB_ROOT} CACHE PATH "Root of Parlib" "/users/npe/src/lithe-docker/parlib")
+
+# Set install prefix (can be overridden by env or cmake -D)
+set(LITHE_PREFIX $ENV{LITHE_PREFIX} CACHE PATH "Install prefix for Lithe and ParLib" "/users/npe/local")
+
+option(LIBOMP_USE_LITHE "Use Lithe threading library" ON)
 if(LIBOMP_USE_LITHE)
-  # Check for Lithe headers
-  find_path(LITHE_INCLUDE_DIR lithe/lithe.h
-    PATHS
-    /Users/npe/src/scythe/lithe/include
-    /usr/local/include
-    /usr/include
-    NO_DEFAULT_PATH
-  )
-  
-  # Check for Lithe library
-  find_library(LITHE_LIBRARY
-    NAMES lithe
-    PATHS
-    /Users/npe/src/scythe/lithe/lib
-    /usr/local/lib
-    /usr/lib
-    NO_DEFAULT_PATH
-  )
-  
-  if(LITHE_INCLUDE_DIR AND LITHE_LIBRARY)
+  find_path(LITHE_INCLUDE_DIR lithe/lithe.h PATHS ${LITHE_PREFIX}/include NO_DEFAULT_PATH)
+  find_library(LITHE_LIBRARY NAMES ithe PATHS ${LITHE_PREFIX}/lib NO_DEFAULT_PATH)
+  find_path(PARLIB_INCLUDE_DIR parlib/parlib.h PATHS ${LITHE_PREFIX}/include NO_DEFAULT_PATH)
+  find_library(PARLIB_LIBRARY NAMES parlib PATHS ${LITHE_PREFIX}/lib NO_DEFAULT_PATH)
+  if(LITHE_INCLUDE_DIR AND LITHE_LIBRARY AND PARLIB_INCLUDE_DIR AND PARLIB_LIBRARY)
     set(LIBOMP_HAVE_LITHE TRUE)
-    include_directories(${LITHE_INCLUDE_DIR})
+    include_directories(${LITHE_PREFIX}/include)
     message(STATUS "LIBOMP: Using Lithe threading library -- YES")
+    message(STATUS "  - Lithe headers: ${LITHE_INCLUDE_DIR}")
+    message(STATUS "  - Lithe library: ${LITHE_LIBRARY}")
+    message(STATUS "  - ParLib headers: ${PARLIB_INCLUDE_DIR}")
+    message(STATUS "  - ParLib library: ${PARLIB_LIBRARY}")
   else()
     set(LIBOMP_HAVE_LITHE FALSE)
     message(STATUS "LIBOMP: Using Lithe threading library -- NO (missing headers or library)")
+    if(NOT LITHE_INCLUDE_DIR)
+      message(STATUS "  - Missing Lithe headers")
+    endif()
+    if(NOT LITHE_LIBRARY)
+      message(STATUS "  - Missing Lithe library")
+    endif()
+    if(NOT PARLIB_INCLUDE_DIR)
+      message(STATUS "  - Missing ParLib headers")
+    endif()
+    if(NOT PARLIB_LIBRARY)
+      message(STATUS "  - Missing ParLib library")
+    endif()
   endif()
-else()
-  set(LIBOMP_HAVE_LITHE FALSE)
-  message(STATUS "LIBOMP: Using Lithe threading library -- NO (disabled)")
 endif()
 
 # Getting correct source files to build library
@@ -157,10 +161,11 @@ libomp_append(LIBOMP_CXXFILES ompt-general.cpp IF_TRUE LIBOMP_OMPT_SUPPORT)
 libomp_append(LIBOMP_CXXFILES tsan_annotations.cpp IF_TRUE LIBOMP_TSAN_SUPPORT)
 
 # Add Lithe-specific files if Lithe support is enabled
-if(LIBOMP_HAVE_LITHE)
+if(LIBOMP_THREADING_BACKEND STREQUAL "lithe")
   libomp_append(LIBOMP_CXXFILES lithe/kmp_lithe.cpp)
   libomp_append(LIBOMP_CXXFILES lithe/kmp_lithe_entry.cpp)
-  add_definitions(-DLIBOMP_USE_LITHE)
+  add_definitions(-DLIBOMP_USE_LITHE -DLITHE_ENABLED)
+  # The -I/users/npe/src/lithe-docker path is already added globally, so lithe/lithe.h will be found
 endif()
 
 set(LIBOMP_SOURCE_FILES ${LIBOMP_CFILES} ${LIBOMP_CXXFILES} ${LIBOMP_ASMFILES})
@@ -228,9 +233,9 @@ endif()
 libomp_get_libflags(LIBOMP_CONFIGURED_LIBFLAGS)
 target_link_libraries(omp ${LIBOMP_CONFIGURED_LIBFLAGS} ${CMAKE_DL_LIBS})
 
-# Add Lithe library if Lithe support is enabled
+# Add Lithe and ParLib libraries if Lithe support is enabled
 if(LIBOMP_HAVE_LITHE)
-  target_link_libraries(omp PRIVATE ithe)
+  target_link_libraries(omp PRIVATE ${LITHE_LIBRARY} ${PARLIB_LIBRARY})
 endif()
 
 # Create *.inc before compiling any sources

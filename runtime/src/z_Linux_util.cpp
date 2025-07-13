@@ -79,11 +79,24 @@ static int __kmp_init_runtime = FALSE;
 
 static int __kmp_fork_count = 0;
 
+#include "lithe/kmp_lithe_pthread_wrappers.h"
+#ifdef LIBOMP_USE_LITHE
+#include "lithe/kmp_lithe.h"
+#else
+#include <pthread.h>
+#include <sched.h>
+#endif
+
 static pthread_condattr_t __kmp_suspend_cond_attr;
 static pthread_mutexattr_t __kmp_suspend_mutex_attr;
 
+#ifdef LIBOMP_USE_LITHE
+static KMP_COND_T __kmp_wait_cv;
+static KMP_MUTEX_T __kmp_wait_mx;
+#else
 static kmp_cond_align_t __kmp_wait_cv;
 static kmp_mutex_align_t __kmp_wait_mx;
+#endif
 
 kmp_uint64 __kmp_ticks_per_msec = 1000000;
 
@@ -429,7 +442,11 @@ void __kmp_terminate_thread(int gtid) {
 
 #ifdef KMP_CANCEL_THREADS
   KA_TRACE(10, ("__kmp_terminate_thread: kill (%d)\n", gtid));
+#ifdef LIBOMP_USE_LITHE
+  status = __kmp_lithe_pthread_cancel(th->th.th_info.ds.ds_thread);
+#else
   status = pthread_cancel(th->th.th_info.ds.ds_thread);
+#endif
   if (status != 0 && status != ESRCH) {
     __kmp_fatal(KMP_MSG(CantTerminateWorkerThread), KMP_ERR(status),
                 __kmp_msg_null);
@@ -460,10 +477,18 @@ static kmp_int32 __kmp_set_stack_info(int gtid, kmp_info_t *th) {
     status = pthread_attr_init(&attr);
     KMP_CHECK_SYSFAIL("pthread_attr_init", status);
 #if KMP_OS_FREEBSD || KMP_OS_NETBSD
+#ifdef LIBOMP_USE_LITHE
+    status = pthread_attr_get_np(__kmp_lithe_pthread_self(), &attr);
+#else
     status = pthread_attr_get_np(pthread_self(), &attr);
+#endif
     KMP_CHECK_SYSFAIL("pthread_attr_get_np", status);
 #else
+#ifdef LIBOMP_USE_LITHE
+    status = pthread_getattr_np(__kmp_lithe_pthread_self(), &attr);
+#else
     status = pthread_getattr_np(pthread_self(), &attr);
+#endif
     KMP_CHECK_SYSFAIL("pthread_getattr_np", status);
 #endif
     status = pthread_attr_getstack(&attr, &addr, &size);
@@ -524,11 +549,13 @@ static void *__kmp_launch_worker(void *thr) {
 #endif
 
 #ifdef KMP_CANCEL_THREADS
+#ifndef LIBOMP_USE_LITHE
   status = pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, &old_type);
   KMP_CHECK_SYSFAIL("pthread_setcanceltype", status);
   // josh todo: isn't PTHREAD_CANCEL_ENABLE default for newly-created threads?
   status = pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, &old_state);
   KMP_CHECK_SYSFAIL("pthread_setcancelstate", status);
+#endif
 #endif
 
 #if KMP_ARCH_X86 || KMP_ARCH_X86_64
@@ -539,10 +566,12 @@ static void *__kmp_launch_worker(void *thr) {
 #endif /* KMP_ARCH_X86 || KMP_ARCH_X86_64 */
 
 #ifdef KMP_BLOCK_SIGNALS
+#ifndef LIBOMP_USE_LITHE
   status = sigfillset(&new_set);
   KMP_CHECK_SYSFAIL_ERRNO("sigfillset", status);
   status = pthread_sigmask(SIG_BLOCK, &new_set, &old_set);
   KMP_CHECK_SYSFAIL("pthread_sigmask", status);
+#endif
 #endif /* KMP_BLOCK_SIGNALS */
 
 #if KMP_OS_LINUX || KMP_OS_FREEBSD || KMP_OS_NETBSD
@@ -559,8 +588,10 @@ static void *__kmp_launch_worker(void *thr) {
   exit_val = __kmp_launch_thread((kmp_info_t *)thr);
 
 #ifdef KMP_BLOCK_SIGNALS
+#ifndef LIBOMP_USE_LITHE
   status = pthread_sigmask(SIG_SETMASK, &old_set, NULL);
   KMP_CHECK_SYSFAIL("pthread_sigmask", status);
+#endif
 #endif /* KMP_BLOCK_SIGNALS */
 
   return exit_val;
@@ -601,11 +632,13 @@ static void *__kmp_launch_monitor(void *thr) {
   __kmp_check_stack_overlap((kmp_info_t *)thr);
 
 #ifdef KMP_CANCEL_THREADS
+#ifndef LIBOMP_USE_LITHE
   status = pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, &old_type);
   KMP_CHECK_SYSFAIL("pthread_setcanceltype", status);
   // josh todo: isn't PTHREAD_CANCEL_ENABLE default for newly-created threads?
   status = pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, &old_state);
   KMP_CHECK_SYSFAIL("pthread_setcancelstate", status);
+#endif
 #endif
 
 #if KMP_REAL_TIME_FIX
@@ -687,20 +720,36 @@ static void *__kmp_launch_monitor(void *thr) {
       now.tv_nsec -= KMP_NSEC_PER_SEC;
     }
 
-    status = pthread_mutex_lock(&__kmp_wait_mx.m_mutex);
-    KMP_CHECK_SYSFAIL("pthread_mutex_lock", status);
+#ifdef LIBOMP_USE_LITHE
+    status = KMP_MUTEX_LOCK(&__kmp_wait_mx);
+    KMP_CHECK_SYSFAIL("KMP_MUTEX_LOCK", status);
     // AC: the monitor should not fall asleep if g_done has been set
     if (!TCR_4(__kmp_global.g.g_done)) { // check once more under mutex
-      status = pthread_cond_timedwait(&__kmp_wait_cv.c_cond,
-                                      &__kmp_wait_mx.m_mutex, &now);
+      status = KMP_COND_WAIT(&__kmp_wait_cv, &__kmp_wait_mx);
       if (status != 0) {
         if (status != ETIMEDOUT && status != EINTR) {
-          KMP_SYSFAIL("pthread_cond_timedwait", status);
+          KMP_SYSFAIL("KMP_COND_WAIT", status);
         }
       }
     }
-    status = pthread_mutex_unlock(&__kmp_wait_mx.m_mutex);
-    KMP_CHECK_SYSFAIL("pthread_mutex_unlock", status);
+    status = KMP_MUTEX_UNLOCK(&__kmp_wait_mx);
+    KMP_CHECK_SYSFAIL("KMP_MUTEX_UNLOCK", status);
+#else
+    status = KMP_MUTEX_LOCK(&__kmp_wait_mx.m_mutex);
+    KMP_CHECK_SYSFAIL("KMP_MUTEX_LOCK", status);
+    // AC: the monitor should not fall asleep if g_done has been set
+    if (!TCR_4(__kmp_global.g.g_done)) { // check once more under mutex
+      status = KMP_COND_TIMEDWAIT(&__kmp_wait_cv.c_cond,
+                                      &__kmp_wait_mx.m_mutex, &now);
+      if (status != 0) {
+        if (status != ETIMEDOUT && status != EINTR) {
+          KMP_SYSFAIL("KMP_COND_TIMEDWAIT", status);
+        }
+      }
+    }
+    status = KMP_MUTEX_UNLOCK(&__kmp_wait_mx.m_mutex);
+    KMP_CHECK_SYSFAIL("KMP_MUTEX_UNLOCK", status);
+#endif
 
     if (__kmp_yield_cycle) {
       yield_cycles++;
@@ -793,7 +842,11 @@ void __kmp_create_worker(int gtid, kmp_info_t *th, size_t stack_size) {
 
   if (KMP_UBER_GTID(gtid)) {
     KA_TRACE(10, ("__kmp_create_worker: uber thread (%d)\n", gtid));
+#ifdef LIBOMP_USE_LITHE
+    th->th.th_info.ds.ds_thread = __kmp_lithe_pthread_self();
+#else
     th->th.th_info.ds.ds_thread = pthread_self();
+#endif
     __kmp_set_stack_info(gtid, th);
     __kmp_check_stack_overlap(th);
     return;
@@ -849,8 +902,13 @@ void __kmp_create_worker(int gtid, kmp_info_t *th, size_t stack_size) {
 
 #endif /* KMP_THREAD_ATTR */
 
+#ifdef LIBOMP_USE_LITHE
+  status =
+      __kmp_lithe_pthread_create(&handle, &thread_attr, __kmp_launch_worker, (void *)th);
+#else
   status =
       pthread_create(&handle, &thread_attr, __kmp_launch_worker, (void *)th);
+#endif
   if (status != 0 || !handle) { // ??? Why do we check handle??
 #ifdef _POSIX_THREAD_ATTR_STACKSIZE
     if (status == EINVAL) {
@@ -973,8 +1031,13 @@ retry:
   }
 #endif /* _POSIX_THREAD_ATTR_STACKSIZE */
 
+#ifdef LIBOMP_USE_LITHE
+  status =
+      __kmp_lithe_pthread_create(&handle, &thread_attr, __kmp_launch_monitor, (void *)th);
+#else
   status =
       pthread_create(&handle, &thread_attr, __kmp_launch_monitor, (void *)th);
+#endif
 
   if (status != 0) {
 #ifdef _POSIX_THREAD_ATTR_STACKSIZE
@@ -1031,7 +1094,11 @@ retry:
 #endif // KMP_USE_MONITOR
 
 void __kmp_exit_thread(int exit_status) {
+#ifdef LIBOMP_USE_LITHE
+  __kmp_lithe_pthread_exit((void *)(intptr_t)exit_status);
+#else
   pthread_exit((void *)(intptr_t)exit_status);
+#endif
 } // __kmp_exit_thread
 
 #if KMP_USE_MONITOR
@@ -1060,12 +1127,20 @@ void __kmp_reap_monitor(kmp_info_t *th) {
      is to avoid performance problem when the monitor sleeps during
      blocktime-size interval */
 
+#ifdef LIBOMP_USE_LITHE
+  status = __kmp_lithe_pthread_kill(th->th.th_info.ds.ds_thread, 0);
+#else
   status = pthread_kill(th->th.th_info.ds.ds_thread, 0);
+#endif
   if (status != ESRCH) {
     __kmp_resume_monitor(); // Wake up the monitor thread
   }
   KA_TRACE(10, ("__kmp_reap_monitor: try to join with monitor\n"));
+#ifdef LIBOMP_USE_LITHE
+  status = __kmp_lithe_pthread_join(th->th.th_info.ds.ds_thread, &exit_val);
+#else
   status = pthread_join(th->th.th_info.ds.ds_thread, &exit_val);
+#endif
   if (exit_val != th) {
     __kmp_fatal(KMP_MSG(ReapMonitorError), KMP_ERR(status), __kmp_msg_null);
   }
@@ -1090,7 +1165,11 @@ void __kmp_reap_worker(kmp_info_t *th) {
   KA_TRACE(
       10, ("__kmp_reap_worker: try to reap T#%d\n", th->th.th_info.ds.ds_gtid));
 
+#ifdef LIBOMP_USE_LITHE
+  status = __kmp_lithe_pthread_join(th->th.th_info.ds.ds_thread, &exit_val);
+#else
   status = pthread_join(th->th.th_info.ds.ds_thread, &exit_val);
+#endif
 #ifdef KMP_DEBUG
   /* Don't expose these to the user until we understand when they trigger */
   if (status != 0) {
@@ -1280,7 +1359,7 @@ static void __kmp_atfork_child(void) {
   // affinity in the parent
   kmp_set_thread_affinity_mask_initial();
 #endif
-  // Set default not to bind threads tightly in the child (we’re expecting
+  // Set default not to bind threads tightly in the child (we're expecting
   // over-subscription after the fork and this can improve things for
   // scripting languages that use OpenMP inside process-parallel code).
   __kmp_affinity_type = affinity_none;
@@ -1366,10 +1445,17 @@ void __kmp_register_atfork(void) {
 
 void __kmp_suspend_initialize(void) {
   int status;
+#ifdef LIBOMP_USE_LITHE
+  status = __kmp_lithe_pthread_mutexattr_init(&__kmp_suspend_mutex_attr);
+  KMP_CHECK_SYSFAIL("__kmp_lithe_pthread_mutexattr_init", status);
+  status = __kmp_lithe_pthread_condattr_init(&__kmp_suspend_cond_attr);
+  KMP_CHECK_SYSFAIL("__kmp_lithe_pthread_condattr_init", status);
+#else
   status = pthread_mutexattr_init(&__kmp_suspend_mutex_attr);
   KMP_CHECK_SYSFAIL("pthread_mutexattr_init", status);
   status = pthread_condattr_init(&__kmp_suspend_cond_attr);
   KMP_CHECK_SYSFAIL("pthread_condattr_init", status);
+#endif
 }
 
 static void __kmp_suspend_initialize_thread(kmp_info_t *th) {
@@ -1378,12 +1464,19 @@ static void __kmp_suspend_initialize_thread(kmp_info_t *th) {
     /* this means we haven't initialized the suspension pthread objects for this
        thread in this instance of the process */
     int status;
+#ifdef LIBOMP_USE_LITHE
+    status = KMP_COND_INIT(&th->th.th_suspend_cv);
+    KMP_CHECK_SYSFAIL("KMP_COND_INIT", status);
+    status = KMP_MUTEX_INIT(&th->th.th_suspend_mx);
+    KMP_CHECK_SYSFAIL("KMP_MUTEX_INIT", status);
+#else
     status = pthread_cond_init(&th->th.th_suspend_cv.c_cond,
                                &__kmp_suspend_cond_attr);
     KMP_CHECK_SYSFAIL("pthread_cond_init", status);
     status = pthread_mutex_init(&th->th.th_suspend_mx.m_mutex,
                                 &__kmp_suspend_mutex_attr);
     KMP_CHECK_SYSFAIL("pthread_mutex_init", status);
+#endif
     *(volatile int *)&th->th.th_suspend_init_count = __kmp_fork_count + 1;
     ANNOTATE_HAPPENS_BEFORE(&th->th.th_suspend_init_count);
   }
@@ -1395,6 +1488,16 @@ void __kmp_suspend_uninitialize_thread(kmp_info_t *th) {
        thread in this instance of the process */
     int status;
 
+#ifdef LIBOMP_USE_LITHE
+    status = KMP_COND_DESTROY(&th->th.th_suspend_cv);
+    if (status != 0 && status != EBUSY) {
+      KMP_SYSFAIL("KMP_COND_DESTROY", status);
+    }
+    status = KMP_MUTEX_DESTROY(&th->th.th_suspend_mx);
+    if (status != 0 && status != EBUSY) {
+      KMP_SYSFAIL("KMP_MUTEX_DESTROY", status);
+    }
+#else
     status = pthread_cond_destroy(&th->th.th_suspend_cv.c_cond);
     if (status != 0 && status != EBUSY) {
       KMP_SYSFAIL("pthread_cond_destroy", status);
@@ -1403,6 +1506,7 @@ void __kmp_suspend_uninitialize_thread(kmp_info_t *th) {
     if (status != 0 && status != EBUSY) {
       KMP_SYSFAIL("pthread_mutex_destroy", status);
     }
+#endif
     --th->th.th_suspend_init_count;
     KMP_DEBUG_ASSERT(th->th.th_suspend_init_count == __kmp_fork_count);
   }
@@ -1422,8 +1526,13 @@ static inline void __kmp_suspend_template(int th_gtid, C *flag) {
 
   __kmp_suspend_initialize_thread(th);
 
+#ifdef LIBOMP_USE_LITHE
+  status = KMP_MUTEX_LOCK(&th->th.th_suspend_mx);
+  KMP_CHECK_SYSFAIL("KMP_MUTEX_LOCK", status);
+#else
   status = pthread_mutex_lock(&th->th.th_suspend_mx.m_mutex);
   KMP_CHECK_SYSFAIL("pthread_mutex_lock", status);
+#endif
 
   KF_TRACE(10, ("__kmp_suspend_template: T#%d setting sleep bit for spin(%p)\n",
                 th_gtid, flag->get()));
@@ -1481,21 +1590,37 @@ static inline void __kmp_suspend_template(int th_gtid, C *flag) {
       now.tv_sec += msecs / 1000;
       now.tv_nsec += (msecs % 1000) * 1000;
 
+#ifdef LIBOMP_USE_LITHE
+      KF_TRACE(15, ("__kmp_suspend_template: T#%d about to perform "
+                    "KMP_COND_TIMEDWAIT\n",
+                    th_gtid));
+      status = KMP_COND_TIMEDWAIT(&th->th.th_suspend_cv.c_cond,
+                                      &th->th.th_suspend_mx, &now);
+#else
       KF_TRACE(15, ("__kmp_suspend_template: T#%d about to perform "
                     "pthread_cond_timedwait\n",
                     th_gtid));
       status = pthread_cond_timedwait(&th->th.th_suspend_cv.c_cond,
-                                      &th->th.th_suspend_mx.m_mutex, &now);
+                                      &th->th.th_suspend_mx, &now);
+#endif
+#else
+#ifdef LIBOMP_USE_LITHE
+      KF_TRACE(15, ("__kmp_suspend_template: T#%d about to perform"
+                    " KMP_COND_WAIT\n",
+                    th_gtid));
+            status = KMP_COND_WAIT(&th->th.th_suspend_cv,
+                             &th->th.th_suspend_mx);
 #else
       KF_TRACE(15, ("__kmp_suspend_template: T#%d about to perform"
                     " pthread_cond_wait\n",
                     th_gtid));
       status = pthread_cond_wait(&th->th.th_suspend_cv.c_cond,
-                                 &th->th.th_suspend_mx.m_mutex);
+                                 &th->th.th_suspend_mx);
+#endif
 #endif
 
       if ((status != 0) && (status != EINTR) && (status != ETIMEDOUT)) {
-        KMP_SYSFAIL("pthread_cond_wait", status);
+        KMP_SYSFAIL("KMP_COND_WAIT", status);
       }
 #ifdef KMP_DEBUG
       if (status == ETIMEDOUT) {
@@ -1532,8 +1657,13 @@ static inline void __kmp_suspend_template(int th_gtid, C *flag) {
   }
 #endif
 
+#ifdef LIBOMP_USE_LITHE
+  status = KMP_MUTEX_UNLOCK(&th->th.th_suspend_mx);
+  KMP_CHECK_SYSFAIL("KMP_MUTEX_UNLOCK", status);
+#else
   status = pthread_mutex_unlock(&th->th.th_suspend_mx.m_mutex);
   KMP_CHECK_SYSFAIL("pthread_mutex_unlock", status);
+#endif
   KF_TRACE(30, ("__kmp_suspend_template: T#%d exit\n", th_gtid));
 }
 
@@ -1566,8 +1696,13 @@ static inline void __kmp_resume_template(int target_gtid, C *flag) {
 
   __kmp_suspend_initialize_thread(th);
 
-  status = pthread_mutex_lock(&th->th.th_suspend_mx.m_mutex);
-  KMP_CHECK_SYSFAIL("pthread_mutex_lock", status);
+#ifdef LIBOMP_USE_LITHE
+  status = KMP_MUTEX_LOCK(&th->th.th_suspend_mx);
+  KMP_CHECK_SYSFAIL("KMP_MUTEX_LOCK", status);
+#else
+      status = KMP_MUTEX_LOCK(&th->th.th_suspend_mx);
+  KMP_CHECK_SYSFAIL("KMP_MUTEX_LOCK", status);
+#endif
 
   if (!flag) { // coming from __kmp_null_resume_wrapper
     flag = (C *)CCAST(void *, th->th.th_sleep_loc);
@@ -1581,8 +1716,13 @@ static inline void __kmp_resume_template(int target_gtid, C *flag) {
     KF_TRACE(5, ("__kmp_resume_template: T#%d exiting, thread T#%d already "
                  "awake: flag(%p)\n",
                  gtid, target_gtid, NULL));
-    status = pthread_mutex_unlock(&th->th.th_suspend_mx.m_mutex);
-    KMP_CHECK_SYSFAIL("pthread_mutex_unlock", status);
+#ifdef LIBOMP_USE_LITHE
+    status = KMP_MUTEX_UNLOCK(&th->th.th_suspend_mx);
+    KMP_CHECK_SYSFAIL("KMP_MUTEX_UNLOCK", status);
+#else
+    status = KMP_MUTEX_UNLOCK(&th->th.th_suspend_mx.m_mutex);
+    KMP_CHECK_SYSFAIL("KMP_MUTEX_UNLOCK", status);
+#endif
     return;
   } else { // if multiple threads are sleeping, flag should be internally
     // referring to a specific thread here
@@ -1592,8 +1732,13 @@ static inline void __kmp_resume_template(int target_gtid, C *flag) {
                    "awake: flag(%p): "
                    "%u => %u\n",
                    gtid, target_gtid, flag->get(), old_spin, flag->load()));
-      status = pthread_mutex_unlock(&th->th.th_suspend_mx.m_mutex);
-      KMP_CHECK_SYSFAIL("pthread_mutex_unlock", status);
+#ifdef LIBOMP_USE_LITHE
+      status = KMP_MUTEX_UNLOCK(&th->th.th_suspend_mx);
+      KMP_CHECK_SYSFAIL("KMP_MUTEX_UNLOCK", status);
+#else
+      status = KMP_MUTEX_UNLOCK(&th->th.th_suspend_mx);
+      KMP_CHECK_SYSFAIL("KMP_MUTEX_UNLOCK", status);
+#endif
       return;
     }
     KF_TRACE(5, ("__kmp_resume_template: T#%d about to wakeup T#%d, reset "
@@ -1611,10 +1756,17 @@ static inline void __kmp_resume_template(int target_gtid, C *flag) {
                  target_gtid, buffer);
   }
 #endif
-  status = pthread_cond_signal(&th->th.th_suspend_cv.c_cond);
-  KMP_CHECK_SYSFAIL("pthread_cond_signal", status);
-  status = pthread_mutex_unlock(&th->th.th_suspend_mx.m_mutex);
-  KMP_CHECK_SYSFAIL("pthread_mutex_unlock", status);
+#ifdef LIBOMP_USE_LITHE
+  status = KMP_COND_SIGNAL(&th->th.th_suspend_cv);
+  KMP_CHECK_SYSFAIL("KMP_COND_SIGNAL", status);
+  status = KMP_MUTEX_UNLOCK(&th->th.th_suspend_mx);
+  KMP_CHECK_SYSFAIL("KMP_MUTEX_UNLOCK", status);
+#else
+  status = KMP_COND_SIGNAL(&th->th.th_suspend_cv);
+  KMP_CHECK_SYSFAIL("KMP_COND_SIGNAL", status);
+  status = KMP_MUTEX_UNLOCK(&th->th.th_suspend_mx);
+  KMP_CHECK_SYSFAIL("KMP_MUTEX_UNLOCK", status);
+#endif
   KF_TRACE(30, ("__kmp_resume_template: T#%d exiting after signaling wake up"
                 " for T#%d\n",
                 gtid, target_gtid));
@@ -1640,20 +1792,21 @@ void __kmp_resume_monitor() {
                 KMP_GTID_MONITOR));
   KMP_DEBUG_ASSERT(gtid != KMP_GTID_MONITOR);
 #endif
-  status = pthread_mutex_lock(&__kmp_wait_mx.m_mutex);
-  KMP_CHECK_SYSFAIL("pthread_mutex_lock", status);
-#ifdef DEBUG_SUSPEND
-  {
-    char buffer[128];
-    __kmp_print_cond(buffer, &__kmp_wait_cv.c_cond);
-    __kmp_printf("__kmp_resume_monitor: T#%d resuming T#%d: %s\n", gtid,
-                 KMP_GTID_MONITOR, buffer);
-  }
+#ifdef LIBOMP_USE_LITHE
+  status = KMP_MUTEX_LOCK(&__kmp_wait_mx);
+  KMP_CHECK_SYSFAIL("KMP_MUTEX_LOCK", status);
+  status = KMP_COND_SIGNAL(&__kmp_wait_cv);
+  KMP_CHECK_SYSFAIL("KMP_COND_SIGNAL", status);
+  status = KMP_MUTEX_UNLOCK(&__kmp_wait_mx);
+  KMP_CHECK_SYSFAIL("KMP_MUTEX_UNLOCK", status);
+#else
+  status = KMP_MUTEX_LOCK(&__kmp_wait_mx);
+  KMP_CHECK_SYSFAIL("KMP_MUTEX_LOCK", status);
+  status = KMP_COND_SIGNAL(&__kmp_wait_cv);
+  KMP_CHECK_SYSFAIL("KMP_COND_SIGNAL", status);
+  status = KMP_MUTEX_UNLOCK(&__kmp_wait_mx);
+  KMP_CHECK_SYSFAIL("KMP_MUTEX_UNLOCK", status);
 #endif
-  status = pthread_cond_signal(&__kmp_wait_cv.c_cond);
-  KMP_CHECK_SYSFAIL("pthread_cond_signal", status);
-  status = pthread_mutex_unlock(&__kmp_wait_mx.m_mutex);
-  KMP_CHECK_SYSFAIL("pthread_mutex_unlock", status);
   KF_TRACE(30, ("__kmp_resume_monitor: T#%d exiting after signaling wake up"
                 " for T#%d\n",
                 gtid, KMP_GTID_MONITOR));
@@ -1670,14 +1823,27 @@ void __kmp_yield(int cond) {
   if (__kmp_yield_cycle && !KMP_YIELD_NOW())
     return;
 #endif
+#ifdef LIBOMP_USE_LITHE
+  if (lithe_sched_current() != NULL) {
+    lithe_context_yield();
+  } else {
   sched_yield();
+  }
+#else
+  sched_yield();
+#endif
 }
 
 void __kmp_gtid_set_specific(int gtid) {
   if (__kmp_init_gtid) {
     int status;
+#ifdef LIBOMP_USE_LITHE
+    status = __kmp_lithe_pthread_setspecific(__kmp_gtid_threadprivate_key,
+                                 (void *)(intptr_t)(gtid + 1));
+#else
     status = pthread_setspecific(__kmp_gtid_threadprivate_key,
                                  (void *)(intptr_t)(gtid + 1));
+#endif
     KMP_CHECK_SYSFAIL("pthread_setspecific", status);
   } else {
     KA_TRACE(50, ("__kmp_gtid_set_specific: runtime shutdown, returning\n"));
@@ -1691,7 +1857,11 @@ int __kmp_gtid_get_specific() {
                   "KMP_GTID_SHUTDOWN\n"));
     return KMP_GTID_SHUTDOWN;
   }
+#ifdef LIBOMP_USE_LITHE
+  gtid = (int)(size_t)__kmp_lithe_pthread_getspecific(__kmp_gtid_threadprivate_key);
+#else
   gtid = (int)(size_t)pthread_getspecific(__kmp_gtid_threadprivate_key);
+#endif
   if (gtid == 0) {
     gtid = KMP_GTID_DNE;
   } else {
@@ -1853,6 +2023,16 @@ void __kmp_runtime_initialize(void) {
   status = pthread_key_create(&__kmp_gtid_threadprivate_key,
                               __kmp_internal_end_dest);
   KMP_CHECK_SYSFAIL("pthread_key_create", status);
+#ifdef LIBOMP_USE_LITHE
+  status = pthread_mutexattr_init(&mutex_attr);
+  KMP_CHECK_SYSFAIL("pthread_mutexattr_init", status);
+  status = KMP_MUTEX_INIT(&__kmp_wait_mx);
+  KMP_CHECK_SYSFAIL("KMP_MUTEX_INIT", status);
+  status = pthread_condattr_init(&cond_attr);
+  KMP_CHECK_SYSFAIL("pthread_condattr_init", status);
+  status = KMP_COND_INIT(&__kmp_wait_cv);
+  KMP_CHECK_SYSFAIL("KMP_COND_INIT", status);
+#else
   status = pthread_mutexattr_init(&mutex_attr);
   KMP_CHECK_SYSFAIL("pthread_mutexattr_init", status);
   status = pthread_mutex_init(&__kmp_wait_mx.m_mutex, &mutex_attr);
@@ -1861,6 +2041,7 @@ void __kmp_runtime_initialize(void) {
   KMP_CHECK_SYSFAIL("pthread_condattr_init", status);
   status = pthread_cond_init(&__kmp_wait_cv.c_cond, &cond_attr);
   KMP_CHECK_SYSFAIL("pthread_cond_init", status);
+#endif
 #if USE_ITT_BUILD
   __kmp_itt_initialize();
 #endif /* USE_ITT_BUILD */
@@ -1882,6 +2063,16 @@ void __kmp_runtime_destroy(void) {
   status = pthread_key_delete(__kmp_gtid_threadprivate_key);
   KMP_CHECK_SYSFAIL("pthread_key_delete", status);
 
+#ifdef LIBOMP_USE_LITHE
+  status = KMP_MUTEX_DESTROY(&__kmp_wait_mx);
+  if (status != 0 && status != EBUSY) {
+    KMP_SYSFAIL("KMP_MUTEX_DESTROY", status);
+  }
+  status = KMP_COND_DESTROY(&__kmp_wait_cv);
+  if (status != 0 && status != EBUSY) {
+    KMP_SYSFAIL("KMP_COND_DESTROY", status);
+  }
+#else
   status = pthread_mutex_destroy(&__kmp_wait_mx.m_mutex);
   if (status != 0 && status != EBUSY) {
     KMP_SYSFAIL("pthread_mutex_destroy", status);
@@ -1890,6 +2081,7 @@ void __kmp_runtime_destroy(void) {
   if (status != 0 && status != EBUSY) {
     KMP_SYSFAIL("pthread_cond_destroy", status);
   }
+#endif
 #if KMP_AFFINITY_SUPPORTED
   __kmp_affinity_uninitialize();
 #endif
