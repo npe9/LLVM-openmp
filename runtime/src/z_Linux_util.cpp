@@ -22,6 +22,149 @@
 #include "kmp_wait_release.h"
 #include "kmp_wrapper_getpid.h"
 
+#ifdef LIBOMP_USE_LITHE
+#ifdef __cplusplus
+#define typeof __typeof__
+#endif
+#include <lithe/lithe.h>
+#include <lithe/fork_join_sched.h>
+extern "C" lithe_fork_join_sched_t *pmix_lithe_get_fork_join_sched(void)
+    __attribute__((weak));
+
+/* OpenMP parallel regions use a dedicated fork-join scheduler nested under
+ * whatever is current (normally OPAL's opal_sched), like libgomp's
+ * libgomp_lithe_sched_alloc + lithe_sched_enter in team.c. PMIx progress
+ * contexts stay on the host-registered opal_sched from pmix_lithe_get_fork_join_sched. */
+enum { __kmp_lithe_fj_stack_max = 32 };
+static __thread lithe_fork_join_sched_t *__kmp_lithe_fj_stack[__kmp_lithe_fj_stack_max];
+static __thread kmp_team_t *__kmp_lithe_fj_team[__kmp_lithe_fj_stack_max];
+static __thread int __kmp_lithe_fj_sp;
+/* One fork-join sched for all outermost OpenMP regions on this uthread: workers
+ * stay on it across regions so we never destroy its vc_mgmt while contexts
+ * still exist (per-region create/destroy + migrate raced RUNNING workers). */
+static __thread lithe_fork_join_sched_t *__kmp_lithe_omp_top_fj;
+
+static lithe_fork_join_sched_t *__kmp_lithe_opal_sched(void) {
+  if (!pmix_lithe_get_fork_join_sched)
+    return NULL;
+  return pmix_lithe_get_fork_join_sched();
+}
+
+static lithe_fork_join_sched_t *__kmp_fj_from_worker_ctx(lithe_fork_join_context_t *ctx) {
+  if (!ctx || !ctx->context.sched)
+    return NULL;
+  return (lithe_fork_join_sched_t *)ctx->context.sched;
+}
+
+static void __kmp_lithe_rebind_ctx(lithe_fork_join_context_t *ctx,
+                                   lithe_fork_join_sched_t *to) {
+  lithe_fork_join_sched_t *from;
+  if (!ctx || !to)
+    return;
+  from = __kmp_fj_from_worker_ctx(ctx);
+  if (!from || from == to)
+    return;
+  if ((lithe_sched_t *)from != ctx->context.sched)
+    return;
+  /* Queues + num_contexts: reassociate alone is insufficient (stale TAILQ on
+     the old sched; destroying the OMP fj would corrupt runnable workers). */
+  lithe_fork_join_context_migrate(from, to, ctx);
+}
+
+extern "C" lithe_fork_join_sched_t *__kmp_lithe_worker_sched_for_create(void) {
+  if (__kmp_lithe_fj_sp > 0)
+    return __kmp_lithe_fj_stack[__kmp_lithe_fj_sp - 1];
+  return __kmp_lithe_opal_sched();
+}
+
+extern "C" void __kmp_lithe_parallel_sched_begin(kmp_team_t *team) {
+  int i;
+  lithe_fork_join_sched_t *fj;
+  lithe_fork_join_sched_t *opal;
+
+  if (!team || team->t.t_nproc <= 1)
+    return;
+  if (!lithe_sched_current())
+    return;
+  if (__kmp_lithe_fj_sp >= __kmp_lithe_fj_stack_max)
+    return;
+  opal = __kmp_lithe_opal_sched();
+  if (!opal)
+    return;
+
+  if (__kmp_lithe_fj_sp == 0) {
+    if (!__kmp_lithe_omp_top_fj) {
+      __kmp_lithe_omp_top_fj = lithe_fork_join_sched_create();
+      if (!__kmp_lithe_omp_top_fj)
+        return;
+    }
+    fj = __kmp_lithe_omp_top_fj;
+  } else {
+    lithe_fork_join_sched_t *parent_fj = __kmp_lithe_fj_stack[__kmp_lithe_fj_sp - 1];
+    int runnable_migrated = 0;
+    fj = lithe_fork_join_sched_create();
+    if (!fj)
+      return;
+    for (i = 1; i < team->t.t_nproc; i++) {
+      kmp_info_t *th = team->t.t_threads[i];
+      if (!th || !th->th.th_lithe_ctx)
+        continue;
+      lithe_fork_join_context_t *wctx =
+          (lithe_fork_join_context_t *)th->th.th_lithe_ctx;
+      if (wctx->context.sched == (lithe_sched_t *)fj)
+        continue;
+      if (wctx->context.sched != (lithe_sched_t *)parent_fj)
+        continue;
+      if (wctx->state == FJS_CTX_RUNNABLE)
+        runnable_migrated++;
+      __kmp_lithe_rebind_ctx(wctx, fj);
+    }
+    lithe_sched_enter((lithe_sched_t *)fj);
+    __kmp_lithe_fj_team[__kmp_lithe_fj_sp] = team;
+    __kmp_lithe_fj_stack[__kmp_lithe_fj_sp++] = fj;
+    if (runnable_migrated > 0)
+      lithe_hart_request(runnable_migrated);
+    return;
+  }
+
+  lithe_sched_enter((lithe_sched_t *)fj);
+  __kmp_lithe_fj_team[__kmp_lithe_fj_sp] = team;
+  __kmp_lithe_fj_stack[__kmp_lithe_fj_sp++] = fj;
+}
+
+extern "C" void __kmp_lithe_parallel_leave(kmp_team_t *team) {
+  int i;
+  lithe_fork_join_sched_t *fj;
+  lithe_fork_join_sched_t *parent_sched;
+
+  if (!team || team->t.t_nproc <= 1)
+    return;
+  if (__kmp_lithe_fj_sp <= 0)
+    return;
+  if (__kmp_lithe_fj_team[__kmp_lithe_fj_sp - 1] != team)
+    return;
+
+  fj = __kmp_lithe_fj_stack[__kmp_lithe_fj_sp - 1];
+  if (__kmp_lithe_fj_sp >= 2) {
+    parent_sched = __kmp_lithe_fj_stack[__kmp_lithe_fj_sp - 2];
+    if (parent_sched) {
+      for (i = 1; i < team->t.t_nproc; i++) {
+        kmp_info_t *th = team->t.t_threads[i];
+        if (!th || !th->th.th_lithe_ctx)
+          continue;
+        __kmp_lithe_rebind_ctx((lithe_fork_join_context_t *)th->th.th_lithe_ctx,
+                              parent_sched);
+      }
+    }
+    lithe_sched_exit();
+    lithe_fork_join_sched_destroy(fj);
+  } else {
+    lithe_sched_exit();
+  }
+  __kmp_lithe_fj_sp--;
+}
+#endif /* LIBOMP_USE_LITHE */
+
 #if !KMP_OS_FREEBSD && !KMP_OS_NETBSD
 #include <alloca.h>
 #endif
@@ -523,6 +666,7 @@ static void *__kmp_launch_worker(void *thr) {
   __kmp_affinity_set_init_mask(gtid, FALSE);
 #endif
 
+#ifndef LIBOMP_USE_LITHE
 #ifdef KMP_CANCEL_THREADS
   status = pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, &old_type);
   KMP_CHECK_SYSFAIL("pthread_setcanceltype", status);
@@ -530,6 +674,7 @@ static void *__kmp_launch_worker(void *thr) {
   status = pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, &old_state);
   KMP_CHECK_SYSFAIL("pthread_setcancelstate", status);
 #endif
+#endif /* !LIBOMP_USE_LITHE */
 
 #if KMP_ARCH_X86 || KMP_ARCH_X86_64
   // Set FP control regs to be a copy of the parallel initialization thread's.
@@ -538,12 +683,14 @@ static void *__kmp_launch_worker(void *thr) {
   __kmp_load_mxcsr(&__kmp_init_mxcsr);
 #endif /* KMP_ARCH_X86 || KMP_ARCH_X86_64 */
 
+#ifndef LIBOMP_USE_LITHE
 #ifdef KMP_BLOCK_SIGNALS
   status = sigfillset(&new_set);
   KMP_CHECK_SYSFAIL_ERRNO("sigfillset", status);
   status = pthread_sigmask(SIG_BLOCK, &new_set, &old_set);
   KMP_CHECK_SYSFAIL("pthread_sigmask", status);
 #endif /* KMP_BLOCK_SIGNALS */
+#endif /* !LIBOMP_USE_LITHE */
 
 #if KMP_OS_LINUX || KMP_OS_FREEBSD || KMP_OS_NETBSD
   if (__kmp_stkoffset > 0 && gtid > 0) {
@@ -552,19 +699,29 @@ static void *__kmp_launch_worker(void *thr) {
 #endif
 
   KMP_MB();
+#ifndef LIBOMP_USE_LITHE
   __kmp_set_stack_info(gtid, (kmp_info_t *)thr);
-
   __kmp_check_stack_overlap((kmp_info_t *)thr);
+#endif
 
   exit_val = __kmp_launch_thread((kmp_info_t *)thr);
 
+#ifndef LIBOMP_USE_LITHE
 #ifdef KMP_BLOCK_SIGNALS
   status = pthread_sigmask(SIG_SETMASK, &old_set, NULL);
   KMP_CHECK_SYSFAIL("pthread_sigmask", status);
 #endif /* KMP_BLOCK_SIGNALS */
+#endif /* !LIBOMP_USE_LITHE */
 
   return exit_val;
 }
+
+#ifdef LIBOMP_USE_LITHE
+static void __kmp_lithe_launch_worker(void *thr) {
+  __kmp_launch_worker(thr);
+  lithe_context_exit();
+}
+#endif
 
 #if KMP_USE_MONITOR
 /* The monitor thread controls all of the threads in the complex */
@@ -766,125 +923,141 @@ static void *__kmp_launch_monitor(void *thr) {
 #endif // KMP_USE_MONITOR
 
 void __kmp_create_worker(int gtid, kmp_info_t *th, size_t stack_size) {
-  pthread_t handle;
-  pthread_attr_t thread_attr;
   int status;
 
   th->th.th_info.ds.ds_gtid = gtid;
 
 #if KMP_STATS_ENABLED
-  // sets up worker thread stats
   __kmp_acquire_tas_lock(&__kmp_stats_lock, gtid);
-
-  // th->th.th_stats is used to transfer thread-specific stats-pointer to
-  // __kmp_launch_worker. So when thread is created (goes into
-  // __kmp_launch_worker) it will set its thread local pointer to
-  // th->th.th_stats
   if (!KMP_UBER_GTID(gtid)) {
     th->th.th_stats = __kmp_stats_list->push_back(gtid);
   } else {
-    // For root threads, __kmp_stats_thread_ptr is set in __kmp_register_root(),
-    // so set the th->th.th_stats field to it.
     th->th.th_stats = __kmp_stats_thread_ptr;
   }
   __kmp_release_tas_lock(&__kmp_stats_lock, gtid);
-
 #endif // KMP_STATS_ENABLED
 
   if (KMP_UBER_GTID(gtid)) {
     KA_TRACE(10, ("__kmp_create_worker: uber thread (%d)\n", gtid));
+#ifdef LIBOMP_USE_LITHE
+    th->th.th_info.ds.ds_thread = pthread_self();
+#else
     th->th.th_info.ds.ds_thread = pthread_self();
     __kmp_set_stack_info(gtid, th);
     __kmp_check_stack_overlap(th);
+#endif
     return;
   }
 
   KA_TRACE(10, ("__kmp_create_worker: try to create thread (%d)\n", gtid));
+  KMP_MB();
 
-  KMP_MB(); /* Flush all pending memory write invalidates.  */
+#ifdef LIBOMP_USE_LITHE
+  {
+    lithe_fork_join_sched_t *sched = __kmp_lithe_worker_sched_for_create();
+    if (!sched) {
+      __kmp_fatal(KMP_MSG(NoResourcesForWorkerThread), KMP_ERR(ENOMEM),
+                  __kmp_msg_null);
+    }
+
+    if (stack_size < (size_t)(64 * 1024))
+      stack_size = 4 * 1024 * 1024;
+
+    lithe_fork_join_context_t *ctx =
+        lithe_fork_join_context_create(sched, stack_size,
+                                       __kmp_lithe_launch_worker, (void *)th);
+    if (!ctx) {
+      __kmp_fatal(KMP_MSG(NoResourcesForWorkerThread), KMP_ERR(ENOMEM),
+                  __kmp_msg_null);
+    }
+
+    th->th.th_lithe_ctx = ctx;
+    th->th.th_info.ds.ds_thread = pthread_self();
+
+    KA_TRACE(10, ("__kmp_create_worker: created lithe context %p for T#%d\n",
+                  (void *)ctx, gtid));
+  }
+#else /* !LIBOMP_USE_LITHE */
+  {
+    pthread_t handle;
+    pthread_attr_t thread_attr;
 
 #ifdef KMP_THREAD_ATTR
-  status = pthread_attr_init(&thread_attr);
-  if (status != 0) {
-    __kmp_fatal(KMP_MSG(CantInitThreadAttrs), KMP_ERR(status), __kmp_msg_null);
-  }
-  status = pthread_attr_setdetachstate(&thread_attr, PTHREAD_CREATE_JOINABLE);
-  if (status != 0) {
-    __kmp_fatal(KMP_MSG(CantSetWorkerState), KMP_ERR(status), __kmp_msg_null);
-  }
+    status = pthread_attr_init(&thread_attr);
+    if (status != 0) {
+      __kmp_fatal(KMP_MSG(CantInitThreadAttrs), KMP_ERR(status), __kmp_msg_null);
+    }
+    status = pthread_attr_setdetachstate(&thread_attr, PTHREAD_CREATE_JOINABLE);
+    if (status != 0) {
+      __kmp_fatal(KMP_MSG(CantSetWorkerState), KMP_ERR(status), __kmp_msg_null);
+    }
 
-  /* Set stack size for this thread now.
-     The multiple of 2 is there because on some machines, requesting an unusual
-     stacksize causes the thread to have an offset before the dummy alloca()
-     takes place to create the offset.  Since we want the user to have a
-     sufficient stacksize AND support a stack offset, we alloca() twice the
-     offset so that the upcoming alloca() does not eliminate any premade offset,
-     and also gives the user the stack space they requested for all threads */
-  stack_size += gtid * __kmp_stkoffset * 2;
+    stack_size += gtid * __kmp_stkoffset * 2;
 
-  KA_TRACE(10, ("__kmp_create_worker: T#%d, default stacksize = %lu bytes, "
-                "__kmp_stksize = %lu bytes, final stacksize = %lu bytes\n",
-                gtid, KMP_DEFAULT_STKSIZE, __kmp_stksize, stack_size));
+    KA_TRACE(10, ("__kmp_create_worker: T#%d, default stacksize = %lu bytes, "
+                  "__kmp_stksize = %lu bytes, final stacksize = %lu bytes\n",
+                  gtid, KMP_DEFAULT_STKSIZE, __kmp_stksize, stack_size));
 
 #ifdef _POSIX_THREAD_ATTR_STACKSIZE
-  status = pthread_attr_setstacksize(&thread_attr, stack_size);
+    status = pthread_attr_setstacksize(&thread_attr, stack_size);
 #ifdef KMP_BACKUP_STKSIZE
-  if (status != 0) {
-    if (!__kmp_env_stksize) {
-      stack_size = KMP_BACKUP_STKSIZE + gtid * __kmp_stkoffset;
-      __kmp_stksize = KMP_BACKUP_STKSIZE;
-      KA_TRACE(10, ("__kmp_create_worker: T#%d, default stacksize = %lu bytes, "
-                    "__kmp_stksize = %lu bytes, (backup) final stacksize = %lu "
-                    "bytes\n",
-                    gtid, KMP_DEFAULT_STKSIZE, __kmp_stksize, stack_size));
-      status = pthread_attr_setstacksize(&thread_attr, stack_size);
+    if (status != 0) {
+      if (!__kmp_env_stksize) {
+        stack_size = KMP_BACKUP_STKSIZE + gtid * __kmp_stkoffset;
+        __kmp_stksize = KMP_BACKUP_STKSIZE;
+        KA_TRACE(10, ("__kmp_create_worker: T#%d, default stacksize = %lu bytes, "
+                      "__kmp_stksize = %lu bytes, (backup) final stacksize = %lu "
+                      "bytes\n",
+                      gtid, KMP_DEFAULT_STKSIZE, __kmp_stksize, stack_size));
+        status = pthread_attr_setstacksize(&thread_attr, stack_size);
+      }
     }
-  }
 #endif /* KMP_BACKUP_STKSIZE */
-  if (status != 0) {
-    __kmp_fatal(KMP_MSG(CantSetWorkerStackSize, stack_size), KMP_ERR(status),
-                KMP_HNT(ChangeWorkerStackSize), __kmp_msg_null);
-  }
+    if (status != 0) {
+      __kmp_fatal(KMP_MSG(CantSetWorkerStackSize, stack_size), KMP_ERR(status),
+                  KMP_HNT(ChangeWorkerStackSize), __kmp_msg_null);
+    }
 #endif /* _POSIX_THREAD_ATTR_STACKSIZE */
 
 #endif /* KMP_THREAD_ATTR */
 
-  status =
-      pthread_create(&handle, &thread_attr, __kmp_launch_worker, (void *)th);
-  if (status != 0 || !handle) { // ??? Why do we check handle??
+    status =
+        pthread_create(&handle, &thread_attr, __kmp_launch_worker, (void *)th);
+    if (status != 0 || !handle) {
 #ifdef _POSIX_THREAD_ATTR_STACKSIZE
-    if (status == EINVAL) {
-      __kmp_fatal(KMP_MSG(CantSetWorkerStackSize, stack_size), KMP_ERR(status),
-                  KMP_HNT(IncreaseWorkerStackSize), __kmp_msg_null);
-    }
-    if (status == ENOMEM) {
-      __kmp_fatal(KMP_MSG(CantSetWorkerStackSize, stack_size), KMP_ERR(status),
-                  KMP_HNT(DecreaseWorkerStackSize), __kmp_msg_null);
-    }
+      if (status == EINVAL) {
+        __kmp_fatal(KMP_MSG(CantSetWorkerStackSize, stack_size), KMP_ERR(status),
+                    KMP_HNT(IncreaseWorkerStackSize), __kmp_msg_null);
+      }
+      if (status == ENOMEM) {
+        __kmp_fatal(KMP_MSG(CantSetWorkerStackSize, stack_size), KMP_ERR(status),
+                    KMP_HNT(DecreaseWorkerStackSize), __kmp_msg_null);
+      }
 #endif /* _POSIX_THREAD_ATTR_STACKSIZE */
-    if (status == EAGAIN) {
-      __kmp_fatal(KMP_MSG(NoResourcesForWorkerThread), KMP_ERR(status),
-                  KMP_HNT(Decrease_NUM_THREADS), __kmp_msg_null);
+      if (status == EAGAIN) {
+        __kmp_fatal(KMP_MSG(NoResourcesForWorkerThread), KMP_ERR(status),
+                    KMP_HNT(Decrease_NUM_THREADS), __kmp_msg_null);
+      }
+      KMP_SYSFAIL("pthread_create", status);
     }
-    KMP_SYSFAIL("pthread_create", status);
-  }
 
-  th->th.th_info.ds.ds_thread = handle;
+    th->th.th_info.ds.ds_thread = handle;
 
 #ifdef KMP_THREAD_ATTR
-  status = pthread_attr_destroy(&thread_attr);
-  if (status) {
-    kmp_msg_t err_code = KMP_ERR(status);
-    __kmp_msg(kmp_ms_warning, KMP_MSG(CantDestroyThreadAttrs), err_code,
-              __kmp_msg_null);
-    if (__kmp_generate_warnings == kmp_warnings_off) {
-      __kmp_str_free(&err_code.str);
+    status = pthread_attr_destroy(&thread_attr);
+    if (status) {
+      kmp_msg_t err_code = KMP_ERR(status);
+      __kmp_msg(kmp_ms_warning, KMP_MSG(CantDestroyThreadAttrs), err_code,
+                __kmp_msg_null);
+      if (__kmp_generate_warnings == kmp_warnings_off) {
+        __kmp_str_free(&err_code.str);
+      }
     }
-  }
 #endif /* KMP_THREAD_ATTR */
+  }
+#endif /* LIBOMP_USE_LITHE */
 
-  KMP_MB(); /* Flush all pending memory write invalidates.  */
-
+  KMP_MB();
   KA_TRACE(10, ("__kmp_create_worker: done creating thread (%d)\n", gtid));
 
 } // __kmp_create_worker
@@ -1085,14 +1258,26 @@ void __kmp_reap_worker(kmp_info_t *th) {
   int status;
   void *exit_val;
 
-  KMP_MB(); /* Flush all pending memory write invalidates.  */
+  KMP_MB();
 
   KA_TRACE(
       10, ("__kmp_reap_worker: try to reap T#%d\n", th->th.th_info.ds.ds_gtid));
 
+#ifdef LIBOMP_USE_LITHE
+  if (th->th.th_lithe_ctx) {
+    lithe_fork_join_context_t *lctx =
+        (lithe_fork_join_context_t *)th->th.th_lithe_ctx;
+    lithe_fork_join_sched_t *sched = __kmp_fj_from_worker_ctx(lctx);
+    if (sched)
+      lithe_fork_join_sched_join_one(sched);
+    lithe_fork_join_context_destroy(lctx);
+    th->th.th_lithe_ctx = NULL;
+    KA_TRACE(10, ("__kmp_reap_worker: done reaping lithe context T#%d\n",
+                  th->th.th_info.ds.ds_gtid));
+  }
+#else
   status = pthread_join(th->th.th_info.ds.ds_thread, &exit_val);
 #ifdef KMP_DEBUG
-  /* Don't expose these to the user until we understand when they trigger */
   if (status != 0) {
     __kmp_fatal(KMP_MSG(ReapWorkerError), KMP_ERR(status), __kmp_msg_null);
   }
@@ -1105,8 +1290,9 @@ void __kmp_reap_worker(kmp_info_t *th) {
 
   KA_TRACE(10, ("__kmp_reap_worker: done reaping T#%d\n",
                 th->th.th_info.ds.ds_gtid));
+#endif /* LIBOMP_USE_LITHE */
 
-  KMP_MB(); /* Flush all pending memory write invalidates.  */
+  KMP_MB();
 }
 
 #if KMP_HANDLE_SIGNALS
@@ -1420,6 +1606,21 @@ static inline void __kmp_suspend_template(int th_gtid, C *flag) {
   KF_TRACE(30, ("__kmp_suspend_template: T#%d enter for flag = %p\n", th_gtid,
                 flag->get()));
 
+#ifdef LIBOMP_USE_LITHE
+  old_spin = flag->set_sleeping();
+  if (flag->done_check_val(old_spin)) {
+    flag->unset_sleeping();
+    return;
+  }
+  TCW_PTR(th->th.th_sleep_loc, (void *)flag);
+  while (flag->is_sleeping()) {
+    lithe_context_yield();
+  }
+  TCW_PTR(th->th.th_sleep_loc, NULL);
+  KF_TRACE(30, ("__kmp_suspend_template: T#%d exit (lithe yield)\n", th_gtid));
+  return;
+#endif /* LIBOMP_USE_LITHE */
+
   __kmp_suspend_initialize_thread(th);
 
   status = pthread_mutex_lock(&th->th.th_suspend_mx.m_mutex);
@@ -1564,6 +1765,19 @@ static inline void __kmp_resume_template(int target_gtid, C *flag) {
                 gtid, target_gtid));
   KMP_DEBUG_ASSERT(gtid != target_gtid);
 
+#ifdef LIBOMP_USE_LITHE
+  if (!flag) {
+    flag = (C *)CCAST(void *, th->th.th_sleep_loc);
+  }
+  if (flag) {
+    flag->unset_sleeping();
+  }
+  TCW_PTR(th->th.th_sleep_loc, NULL);
+  KF_TRACE(30, ("__kmp_resume_template: T#%d wakeup T#%d (lithe)\n",
+                gtid, target_gtid));
+  return;
+#endif /* LIBOMP_USE_LITHE */
+
   __kmp_suspend_initialize_thread(th);
 
   status = pthread_mutex_lock(&th->th.th_suspend_mx.m_mutex);
@@ -1661,6 +1875,10 @@ void __kmp_resume_monitor() {
 #endif // KMP_USE_MONITOR
 
 void __kmp_yield(int cond) {
+#ifdef LIBOMP_USE_LITHE
+  (void)cond;
+  lithe_context_yield();
+#else
   if (!cond)
     return;
 #if KMP_USE_MONITOR
@@ -1671,6 +1889,7 @@ void __kmp_yield(int cond) {
     return;
 #endif
   sched_yield();
+#endif /* LIBOMP_USE_LITHE */
 }
 
 void __kmp_gtid_set_specific(int gtid) {

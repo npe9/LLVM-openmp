@@ -2518,6 +2518,10 @@ typedef struct KMP_ALIGN_CACHE kmp_base_info {
   kmp_uint32 th_reap_state; // Non-zero indicates thread is not
   // tasking, thus safe to reap
 
+#ifdef LIBOMP_USE_LITHE
+  void *th_lithe_ctx; // Lithe fork-join context for this worker (NULL for uber)
+#endif
+
   /* More stuff for keeping track of active/sleeping threads (this part is
      written by the worker thread) */
   kmp_uint8 th_active_in_pool; // included in count of #active threads in pool

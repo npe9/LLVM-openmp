@@ -6,6 +6,19 @@
 #define KMP_LITHE_H
 
 #include "kmp.h"
+
+/* 
+ * Parlib headers use GNU C extensions (typeof, statement expressions) that 
+ * don't work in C++. We need to override the problematic macros.
+ * The ROUNDDOWN/ROUNDUP macros in parlib/common.h are used by inline functions
+ * in ucontext.h, so we need to define our C++ compatible versions and make 
+ * sure parlib doesn't override them.
+ */
+#ifdef __cplusplus
+/* Force use of __typeof__ (GNU C++) instead of typeof */
+#define typeof __typeof__
+#endif
+
 #include "lithe/lithe.h"
 #include "lithe/sched.h"
 

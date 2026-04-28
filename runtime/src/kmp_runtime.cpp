@@ -42,6 +42,11 @@
 
 #include "tsan_annotations.h"
 
+#if defined(LIBOMP_USE_LITHE)
+extern "C" void __kmp_lithe_parallel_sched_begin(kmp_team_t *team);
+extern "C" void __kmp_lithe_parallel_leave(kmp_team_t *team);
+#endif
+
 #if defined(KMP_GOMP_COMPAT)
 char const __kmp_version_alt_comp[] =
     KMP_VERSION_PREFIX "alternative compiler support: yes";
@@ -2181,6 +2186,10 @@ int __kmp_fork_call(ident_t *loc, int gtid,
     if (!root->r.r_active) // Only do assignment if it prevents cache ping-pong
       root->r.r_active = TRUE;
 
+#if defined(LIBOMP_USE_LITHE)
+    if (team->t.t_nproc > 1)
+      __kmp_lithe_parallel_sched_begin(team);
+#endif
     __kmp_fork_team_threads(root, team, master_th, gtid);
     __kmp_setup_icv_copy(team, nthreads,
                          &master_th->th.th_current_task->td_icvs, loc);
@@ -2393,6 +2402,11 @@ void __kmp_join_call(ident_t *loc, int gtid
         0; // AC: no tasking in teams (out of any parallel)
   }
 #endif /* OMP_40_ENABLED */
+
+#if defined(LIBOMP_USE_LITHE)
+  if (team->t.t_nproc > 1)
+    __kmp_lithe_parallel_leave(team);
+#endif
 
   KMP_MB();
 

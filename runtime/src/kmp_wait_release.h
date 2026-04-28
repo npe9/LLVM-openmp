@@ -355,11 +355,18 @@ final_spin=FALSE)
     // TODO: Should it be number of cores instead of thread contexts? Like:
     // KMP_YIELD(TCR_4(__kmp_nth) > __kmp_ncores);
     // Need performance improvement data to make the change...
+#ifdef LIBOMP_USE_LITHE
+    // Under Lithe cooperative scheduling, always yield the vcore immediately
+    // rather than burning it in a spin loop. Spinning wastes a vcore that
+    // another context could use.
+    KMP_YIELD(1);
+#else
     if (oversubscribed) {
       KMP_YIELD(1);
     } else {
       KMP_YIELD_SPIN(spins);
     }
+#endif
     // Check if this thread was transferred from a team
     // to the thread pool (or vice-versa) while spinning.
     in_pool = !!TCR_4(this_thr->th.th_in_pool);

@@ -54,32 +54,24 @@ endif()
 # Check for Lithe support
 option(LIBOMP_USE_LITHE "Use Lithe threading library" OFF)
 if(LIBOMP_USE_LITHE)
-  # Check for Lithe headers
   find_path(LITHE_INCLUDE_DIR lithe/lithe.h
-    PATHS
-    /Users/npe/src/scythe/lithe/include
-    /usr/local/include
-    /usr/include
-    NO_DEFAULT_PATH
+    HINTS ${CMAKE_INCLUDE_PATH}
+    PATHS /usr/local/include /usr/include
   )
   
-  # Check for Lithe library
   find_library(LITHE_LIBRARY
-    NAMES lithe
-    PATHS
-    /Users/npe/src/scythe/lithe/lib
-    /usr/local/lib
-    /usr/lib
-    NO_DEFAULT_PATH
+    NAMES ithe lithe
+    HINTS ${CMAKE_LIBRARY_PATH}
+    PATHS /usr/local/lib /usr/lib
   )
   
   if(LITHE_INCLUDE_DIR AND LITHE_LIBRARY)
     set(LIBOMP_HAVE_LITHE TRUE)
     include_directories(${LITHE_INCLUDE_DIR})
-    message(STATUS "LIBOMP: Using Lithe threading library -- YES")
+    message(STATUS "LIBOMP: Lithe found: include=${LITHE_INCLUDE_DIR} lib=${LITHE_LIBRARY}")
   else()
     set(LIBOMP_HAVE_LITHE FALSE)
-    message(STATUS "LIBOMP: Using Lithe threading library -- NO (missing headers or library)")
+    message(STATUS "LIBOMP: Lithe NOT found (include=${LITHE_INCLUDE_DIR} lib=${LITHE_LIBRARY})")
   endif()
 else()
   set(LIBOMP_HAVE_LITHE FALSE)
@@ -132,13 +124,19 @@ else()
     if("${LIBOMP_ARCH}" STREQUAL "aarch64")
       libomp_append(LIBOMP_ASMFILES z_Darwin_asm.S) # macOS ARM64 assembly file
     else()
-      libomp_append(LIBOMP_ASMFILES z_Linux_asm.S) # Unix assembly file for other architectures
+      # Don't include assembly file when using Lithe - kmp_lithe_entry provides __kmp_invoke_microtask
+      if(NOT LIBOMP_HAVE_LITHE)
+        libomp_append(LIBOMP_ASMFILES z_Linux_asm.S) # Unix assembly file for other architectures
+      endif()
     endif()
   else()
     # Unix specific files
     libomp_append(LIBOMP_CXXFILES z_Linux_util.cpp)
     libomp_append(LIBOMP_CXXFILES kmp_gsupport.cpp)
-    libomp_append(LIBOMP_ASMFILES z_Linux_asm.S) # Unix assembly file
+    # Don't include assembly file when using Lithe - kmp_lithe_entry provides __kmp_invoke_microtask
+    if(NOT LIBOMP_HAVE_LITHE)
+      libomp_append(LIBOMP_ASMFILES z_Linux_asm.S) # Unix assembly file
+    endif()
   endif()
   libomp_append(LIBOMP_CFILES thirdparty/ittnotify/ittnotify_static.c LIBOMP_USE_ITT_NOTIFY)
   libomp_append(LIBOMP_CXXFILES kmp_debugger.cpp LIBOMP_USE_DEBUGGER)
@@ -227,6 +225,11 @@ endif()
 # Linking command will include libraries in LIBOMP_CONFIGURED_LIBFLAGS
 libomp_get_libflags(LIBOMP_CONFIGURED_LIBFLAGS)
 target_link_libraries(omp ${LIBOMP_CONFIGURED_LIBFLAGS} ${CMAKE_DL_LIBS})
+
+# Link against Lithe library when using Lithe
+if(LIBOMP_HAVE_LITHE)
+  target_link_libraries(omp ${LITHE_LIBRARY})
+endif()
 
 # Create *.inc before compiling any sources
 # objects depend on : .inc files
