@@ -158,6 +158,7 @@ libomp_append(LIBOMP_CXXFILES tsan_annotations.cpp IF_TRUE LIBOMP_TSAN_SUPPORT)
 if(LIBOMP_HAVE_LITHE)
   libomp_append(LIBOMP_CXXFILES lithe/kmp_lithe.cpp)
   libomp_append(LIBOMP_CXXFILES lithe/kmp_lithe_entry.cpp)
+  libomp_append(LIBOMP_CXXFILES lithe/kmp_lithe_parlib_monitor.cpp)
   add_definitions(-DLIBOMP_USE_LITHE)
 endif()
 

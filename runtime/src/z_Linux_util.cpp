@@ -1091,6 +1091,22 @@ void __kmp_create_monitor(kmp_info_t *th) {
   TCW_4(__kmp_global.g.g_time.dt.t_value, 0);
 #endif // KMP_REAL_TIME_FIX
 
+#ifdef LIBOMP_USE_LITHE
+extern void __kmp_lithe_parlib_monitor_start(kmp_info_t *th);
+#endif
+
+#ifdef LIBOMP_USE_LITHE
+  th->th.th_info.ds.ds_thread = (pthread_t)0;
+  __kmp_lithe_parlib_monitor_start(th);
+
+  KMP_MB(); /* Flush all pending memory write invalidates.  */
+
+  KA_TRACE(10,
+           ("__kmp_create_monitor: lithe parlib alarm monitor started\n"));
+
+  return;
+#else /* !LIBOMP_USE_LITHE */
+
 #ifdef KMP_THREAD_ATTR
   if (__kmp_monitor_stksize == 0) {
     __kmp_monitor_stksize = KMP_DEFAULT_MONITOR_STKSIZE;
@@ -1200,6 +1216,8 @@ retry:
   KA_TRACE(10, ("__kmp_create_monitor: monitor created %#.8lx\n",
                 th->th.th_info.ds.ds_thread));
 
+#endif /* !LIBOMP_USE_LITHE */
+
 } // __kmp_create_monitor
 #endif // KMP_USE_MONITOR
 
@@ -1208,6 +1226,9 @@ void __kmp_exit_thread(int exit_status) {
 } // __kmp_exit_thread
 
 #if KMP_USE_MONITOR
+#ifdef LIBOMP_USE_LITHE
+extern void __kmp_lithe_parlib_monitor_stop(void);
+#endif
 void __kmp_resume_monitor();
 
 void __kmp_reap_monitor(kmp_info_t *th) {
@@ -1228,6 +1249,15 @@ void __kmp_reap_monitor(kmp_info_t *th) {
   }
 
   KMP_MB(); /* Flush all pending memory write invalidates.  */
+
+#ifdef LIBOMP_USE_LITHE
+  __kmp_lithe_parlib_monitor_stop();
+  th->th.th_info.ds.ds_tid = KMP_GTID_DNE;
+  th->th.th_info.ds.ds_gtid = KMP_GTID_DNE;
+  KMP_MB();
+  KA_TRACE(10, ("__kmp_reap_monitor: done reaping parlib alarm monitor\n"));
+  return;
+#endif /* LIBOMP_USE_LITHE */
 
   /* First, check to see whether the monitor thread exists to wake it up. This
      is to avoid performance problem when the monitor sleeps during
