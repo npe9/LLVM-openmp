@@ -54,14 +54,21 @@ endif()
 # Check for Lithe support
 option(LIBOMP_USE_LITHE "Use Lithe threading library" OFF)
 if(LIBOMP_USE_LITHE)
+  # Match this repo's lithe install layout (install-lithe/{include,lib}) via LITHE_DIR.
+  set(_LIBOMP_LITHE_INCLUDE_HINTS ${CMAKE_INCLUDE_PATH})
+  set(_LIBOMP_LITHE_LIB_HINTS ${CMAKE_LIBRARY_PATH})
+  if(DEFINED ENV{LITHE_DIR} AND NOT "$ENV{LITHE_DIR}" STREQUAL "")
+    list(APPEND _LIBOMP_LITHE_INCLUDE_HINTS "$ENV{LITHE_DIR}/include")
+    list(APPEND _LIBOMP_LITHE_LIB_HINTS "$ENV{LITHE_DIR}/lib")
+  endif()
   find_path(LITHE_INCLUDE_DIR lithe/lithe.h
-    HINTS ${CMAKE_INCLUDE_PATH}
+    HINTS ${_LIBOMP_LITHE_INCLUDE_HINTS}
     PATHS /usr/local/include /usr/include
   )
-  
+
   find_library(LITHE_LIBRARY
-    NAMES ithe lithe
-    HINTS ${CMAKE_LIBRARY_PATH}
+    NAMES lithe
+    HINTS ${_LIBOMP_LITHE_LIB_HINTS}
     PATHS /usr/local/lib /usr/lib
   )
   
@@ -73,6 +80,8 @@ if(LIBOMP_USE_LITHE)
     set(LIBOMP_HAVE_LITHE FALSE)
     message(STATUS "LIBOMP: Lithe NOT found (include=${LITHE_INCLUDE_DIR} lib=${LITHE_LIBRARY})")
   endif()
+  unset(_LIBOMP_LITHE_INCLUDE_HINTS)
+  unset(_LIBOMP_LITHE_LIB_HINTS)
 else()
   set(LIBOMP_HAVE_LITHE FALSE)
   message(STATUS "LIBOMP: Using Lithe threading library -- NO (disabled)")
