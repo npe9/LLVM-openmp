@@ -43,6 +43,7 @@
 #include "tsan_annotations.h"
 
 #if defined(LIBOMP_USE_LITHE)
+extern "C" void __kmp_lithe_ensure_bootstrap(void);
 extern "C" void __kmp_lithe_parallel_sched_begin(kmp_team_t *team);
 extern "C" void __kmp_lithe_parallel_leave(kmp_team_t *team);
 #endif
@@ -2187,6 +2188,12 @@ int __kmp_fork_call(ident_t *loc, int gtid,
       root->r.r_active = TRUE;
 
 #if defined(LIBOMP_USE_LITHE)
+    /* Ensure the general lithe bootstrap (main->vcore0 + parlib vcore pool +
+     * root fork-join scheduler) is in place before running ANY region,
+     * including OMP=1. Runtime-combination agnostic and idempotent: composes
+     * onto an MPI/OPAL-provided root if present, otherwise drives the
+     * lithe-owned root. See lithe-bootstrap-any-runtime-combination. */
+    __kmp_lithe_ensure_bootstrap();
     if (team->t.t_nproc > 1)
       __kmp_lithe_parallel_sched_begin(team);
 #endif
@@ -5784,7 +5791,18 @@ static void __kmp_reap_thread(kmp_info_t *thread, int is_root) {
 
   if (!is_root) {
 
-    if (__kmp_dflt_blocktime != KMP_MAX_BLOCKTIME) {
+#ifdef LIBOMP_USE_LITHE
+    /* Lithe workers must always be released from the fork barrier here so they
+     * return from __kmp_launch_worker, self-destroy their lithe context, and
+     * signal the reap-join handshake __kmp_reap_worker now waits on. Gating this
+     * on blocktime (as the non-lithe path does) would hang the join when a user
+     * forces KMP_BLOCKTIME=infinite. */
+    const bool __kmp_lithe_release_for_reap = true;
+#else
+    const bool __kmp_lithe_release_for_reap =
+        (__kmp_dflt_blocktime != KMP_MAX_BLOCKTIME);
+#endif
+    if (__kmp_lithe_release_for_reap) {
       /* Assume the threads are at the fork barrier here */
       KA_TRACE(
           20, ("__kmp_reap_thread: releasing T#%d from fork barrier for reap\n",
@@ -6400,6 +6418,17 @@ static void __kmp_check_mic_type() {
 static void __kmp_do_serial_initialize(void) {
   int i, gtid;
   int size;
+
+#if defined(LIBOMP_USE_LITHE)
+  /* MUST be first: serial init below uses lithe-backed bootstrap locks whose
+   * unlock path yields the current uthread. Without main->vcore0 done first,
+   * current_uthread is NULL and the very first lock release segfaults. The
+   * general lithe bootstrap (main->vcore0 + parlib vcore pool + root FJ sched)
+   * is owned by lithe/parlib and is idempotent / runtime-combination agnostic;
+   * if MPI/OPAL already bootstrapped, this composes onto the same root. See
+   * lithe-bootstrap-any-runtime-combination. */
+  __kmp_lithe_ensure_bootstrap();
+#endif
 
   KA_TRACE(10, ("__kmp_do_serial_initialize: enter\n"));
 

@@ -3,6 +3,8 @@
  * When using Lithe, z_Linux_asm.S is not built, so we provide __kmp_hardware_timestamp here.
  */
 
+#include <cstdio>
+#include <cstdlib>
 #include "kmp_lithe.h"
 #include "kmp_i18n.h"
 #include "kmp_io.h"
@@ -22,12 +24,57 @@ extern "C" kmp_critical_name *__kmp_unnamed_critical_addr = &__kmp_gomp_critical
 // Flag to indicate if Lithe integration is initialized
 static int __kmp_lithe_initialized = 0;
 
-// Entry point for microtask invocation via Lithe
-// This is the function that will be called by the assembly stub
+// Entry point for microtask invocation via Lithe.
+//
+// In a normal libomp build this is implemented in z_Linux_asm.S and forwards an
+// ARBITRARY number of outlined-region arguments (argc of them, from p_argv[])
+// to the variadic microtask. The Lithe build does not assemble z_Linux_asm.S,
+// so this C replacement must reproduce that contract. The previous version
+// hardcoded exactly 4 arguments (p_argv[0..3]) regardless of argc: any OpenMP
+// region capturing more than 4 shared variables (e.g. a persistent-region CG
+// kernel with ~14 shared arrays/scalars) passed garbage pointers for args 5+,
+// causing a segfault the first time a worker touched one. Forward all argc
+// arguments via a switch (matches the generic non-asm libomp invoker).
 extern "C" int
-__kmp_invoke_microtask(microtask_t pkfn, int gtid, int npr, int argc, void *p_argv[], void **exit_frame) {
-    // Call the microtask function
-    (*pkfn)(&gtid, &npr, p_argv[0], p_argv[1], p_argv[2], p_argv[3]);
+__kmp_invoke_microtask(microtask_t pkfn, int gtid, int npr, int argc, void *p_argv[],
+                       void **exit_frame) {
+    if (exit_frame)
+        *exit_frame = NULL;
+    void **a = p_argv;
+    switch (argc) {
+    case 0:  (*pkfn)(&gtid, &npr); break;
+    case 1:  (*pkfn)(&gtid, &npr, a[0]); break;
+    case 2:  (*pkfn)(&gtid, &npr, a[0], a[1]); break;
+    case 3:  (*pkfn)(&gtid, &npr, a[0], a[1], a[2]); break;
+    case 4:  (*pkfn)(&gtid, &npr, a[0], a[1], a[2], a[3]); break;
+    case 5:  (*pkfn)(&gtid, &npr, a[0], a[1], a[2], a[3], a[4]); break;
+    case 6:  (*pkfn)(&gtid, &npr, a[0], a[1], a[2], a[3], a[4], a[5]); break;
+    case 7:  (*pkfn)(&gtid, &npr, a[0], a[1], a[2], a[3], a[4], a[5], a[6]); break;
+    case 8:  (*pkfn)(&gtid, &npr, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]); break;
+    case 9:  (*pkfn)(&gtid, &npr, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]); break;
+    case 10: (*pkfn)(&gtid, &npr, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9]); break;
+    case 11: (*pkfn)(&gtid, &npr, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10]); break;
+    case 12: (*pkfn)(&gtid, &npr, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11]); break;
+    case 13: (*pkfn)(&gtid, &npr, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12]); break;
+    case 14: (*pkfn)(&gtid, &npr, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13]); break;
+    case 15: (*pkfn)(&gtid, &npr, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14]); break;
+    case 16: (*pkfn)(&gtid, &npr, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15]); break;
+    case 17: (*pkfn)(&gtid, &npr, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15], a[16]); break;
+    case 18: (*pkfn)(&gtid, &npr, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15], a[16], a[17]); break;
+    case 19: (*pkfn)(&gtid, &npr, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15], a[16], a[17], a[18]); break;
+    case 20: (*pkfn)(&gtid, &npr, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12], a[13], a[14], a[15], a[16], a[17], a[18], a[19]); break;
+    default:
+        // The non-asm Lithe invoker enumerates a fixed maximum of region
+        // arguments. >20 captured shared variables in a single OpenMP region is
+        // far beyond anything in this suite; fail loudly rather than silently
+        // forwarding garbage (the old 4-arg bug). Raise the cases above if ever
+        // needed -- do NOT fall back to an ABI assumption.
+        fprintf(stderr,
+                "[LITHE-OMP] FATAL: __kmp_invoke_microtask argc=%d exceeds the "
+                "supported maximum (20). Extend the switch in kmp_lithe_entry.cpp.\n",
+                argc);
+        abort();
+    }
     return 1;
 }
 

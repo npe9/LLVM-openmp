@@ -27,6 +27,21 @@
 
 #include "tsan_annotations.h"
 
+#ifdef LIBOMP_USE_LITHE
+/* CHANGE 2 (O(1) team broadcast wake): bracket the master's worker-release
+ * dispatch so the N per-worker lithe_context_unblock -> hart_request(1) +
+ * reactor_wake calls collapse into a single hart_request(N) + one reactor_wake.
+ * Resolved from liblithe.so at runtime (built before libomp per BUILD_ORDER).
+ * Workers' release path issues no unblocks, so an empty batch is a no-op. */
+extern "C" void lithe_fork_join_wake_batch_begin(void);
+extern "C" void lithe_fork_join_wake_batch_end(void);
+#define LITHE_WAKE_BATCH_BEGIN() lithe_fork_join_wake_batch_begin()
+#define LITHE_WAKE_BATCH_END() lithe_fork_join_wake_batch_end()
+#else
+#define LITHE_WAKE_BATCH_BEGIN() ((void)0)
+#define LITHE_WAKE_BATCH_END() ((void)0)
+#endif
+
 #if KMP_MIC && USE_NGO_STORES
 // ICV copying
 #define ngo_load(src) __m512d Vt = _mm512_load_pd((void *)(src))
@@ -49,6 +64,12 @@ static void __kmp_linear_barrier_gather(
     enum barrier_type bt, kmp_info_t *this_thr, int gtid, int tid,
     void (*reduce)(void *, void *) USE_ITT_BUILD_ARG(void *itt_sync_obj)) {
   KMP_TIME_DEVELOPER_PARTITIONED_BLOCK(KMP_linear_gather);
+#ifdef LIBOMP_USE_LITHE
+  // Tag the barrier class for __kmp_wait_template: intra-region (plain/
+  // reduction) barriers hot-spin holding the hart (team-local wake); only
+  // fork/join (region-boundary) barriers cooperatively release the hart.
+  this_thr->th.th_lithe_barrier_inner = (bt != bs_forkjoin_barrier);
+#endif
   kmp_team_t *team = this_thr->th.th_team;
   kmp_bstate_t *thr_bar = &this_thr->th.th_bar[bt].bb;
   kmp_info_t **other_threads = team->t.t_threads;
@@ -144,6 +165,9 @@ static void __kmp_linear_barrier_release(
     enum barrier_type bt, kmp_info_t *this_thr, int gtid, int tid,
     int propagate_icvs USE_ITT_BUILD_ARG(void *itt_sync_obj)) {
   KMP_TIME_DEVELOPER_PARTITIONED_BLOCK(KMP_linear_release);
+#ifdef LIBOMP_USE_LITHE
+  this_thr->th.th_lithe_barrier_inner = (bt != bs_forkjoin_barrier);
+#endif
   kmp_bstate_t *thr_bar = &this_thr->th.th_bar[bt].bb;
   kmp_team_t *team;
 
@@ -248,6 +272,9 @@ __kmp_tree_barrier_gather(enum barrier_type bt, kmp_info_t *this_thr, int gtid,
                           int tid, void (*reduce)(void *, void *)
                                        USE_ITT_BUILD_ARG(void *itt_sync_obj)) {
   KMP_TIME_DEVELOPER_PARTITIONED_BLOCK(KMP_tree_gather);
+#ifdef LIBOMP_USE_LITHE
+  this_thr->th.th_lithe_barrier_inner = (bt != bs_forkjoin_barrier);
+#endif
   kmp_team_t *team = this_thr->th.th_team;
   kmp_bstate_t *thr_bar = &this_thr->th.th_bar[bt].bb;
   kmp_info_t **other_threads = team->t.t_threads;
@@ -356,6 +383,9 @@ static void __kmp_tree_barrier_release(
     enum barrier_type bt, kmp_info_t *this_thr, int gtid, int tid,
     int propagate_icvs USE_ITT_BUILD_ARG(void *itt_sync_obj)) {
   KMP_TIME_DEVELOPER_PARTITIONED_BLOCK(KMP_tree_release);
+#ifdef LIBOMP_USE_LITHE
+  this_thr->th.th_lithe_barrier_inner = (bt != bs_forkjoin_barrier);
+#endif
   kmp_team_t *team;
   kmp_bstate_t *thr_bar = &this_thr->th.th_bar[bt].bb;
   kmp_uint32 nproc;
@@ -465,6 +495,9 @@ __kmp_hyper_barrier_gather(enum barrier_type bt, kmp_info_t *this_thr, int gtid,
                            int tid, void (*reduce)(void *, void *)
                                         USE_ITT_BUILD_ARG(void *itt_sync_obj)) {
   KMP_TIME_DEVELOPER_PARTITIONED_BLOCK(KMP_hyper_gather);
+#ifdef LIBOMP_USE_LITHE
+  this_thr->th.th_lithe_barrier_inner = (bt != bs_forkjoin_barrier);
+#endif
   kmp_team_t *team = this_thr->th.th_team;
   kmp_bstate_t *thr_bar = &this_thr->th.th_bar[bt].bb;
   kmp_info_t **other_threads = team->t.t_threads;
@@ -584,6 +617,9 @@ static void __kmp_hyper_barrier_release(
     enum barrier_type bt, kmp_info_t *this_thr, int gtid, int tid,
     int propagate_icvs USE_ITT_BUILD_ARG(void *itt_sync_obj)) {
   KMP_TIME_DEVELOPER_PARTITIONED_BLOCK(KMP_hyper_release);
+#ifdef LIBOMP_USE_LITHE
+  this_thr->th.th_lithe_barrier_inner = (bt != bs_forkjoin_barrier);
+#endif
   kmp_team_t *team;
   kmp_bstate_t *thr_bar = &this_thr->th.th_bar[bt].bb;
   kmp_info_t **other_threads;
@@ -816,6 +852,9 @@ static void __kmp_hierarchical_barrier_gather(
     enum barrier_type bt, kmp_info_t *this_thr, int gtid, int tid,
     void (*reduce)(void *, void *) USE_ITT_BUILD_ARG(void *itt_sync_obj)) {
   KMP_TIME_DEVELOPER_PARTITIONED_BLOCK(KMP_hier_gather);
+#ifdef LIBOMP_USE_LITHE
+  this_thr->th.th_lithe_barrier_inner = (bt != bs_forkjoin_barrier);
+#endif
   kmp_team_t *team = this_thr->th.th_team;
   kmp_bstate_t *thr_bar = &this_thr->th.th_bar[bt].bb;
   kmp_uint32 nproc = this_thr->th.th_team_nproc;
@@ -995,6 +1034,9 @@ static void __kmp_hierarchical_barrier_release(
     enum barrier_type bt, kmp_info_t *this_thr, int gtid, int tid,
     int propagate_icvs USE_ITT_BUILD_ARG(void *itt_sync_obj)) {
   KMP_TIME_DEVELOPER_PARTITIONED_BLOCK(KMP_hier_release);
+#ifdef LIBOMP_USE_LITHE
+  this_thr->th.th_lithe_barrier_inner = (bt != bs_forkjoin_barrier);
+#endif
   kmp_team_t *team;
   kmp_bstate_t *thr_bar = &this_thr->th.th_bar[bt].bb;
   kmp_uint32 nproc;
@@ -1418,6 +1460,7 @@ int __kmp_barrier(enum barrier_type bt, int gtid, int is_split,
 #endif /* USE_ITT_BUILD */
     }
     if (status == 1 || !is_split) {
+      LITHE_WAKE_BATCH_BEGIN();
       switch (__kmp_barrier_release_pattern[bt]) {
       case bp_hyper_bar: {
         KMP_ASSERT(__kmp_barrier_release_branch_bits[bt]);
@@ -1441,6 +1484,7 @@ int __kmp_barrier(enum barrier_type bt, int gtid, int is_split,
                                      FALSE USE_ITT_BUILD_ARG(itt_sync_obj));
       }
       }
+      LITHE_WAKE_BATCH_END();
       if (__kmp_tasking_mode != tskm_immediate_exec) {
         __kmp_task_team_sync(this_thr, team);
       }
@@ -1520,6 +1564,7 @@ void __kmp_end_split_barrier(enum barrier_type bt, int gtid) {
   ANNOTATE_BARRIER_BEGIN(&team->t.t_bar);
   if (!team->t.t_serialized) {
     if (KMP_MASTER_GTID(gtid)) {
+      LITHE_WAKE_BATCH_BEGIN();
       switch (__kmp_barrier_release_pattern[bt]) {
       case bp_hyper_bar: {
         KMP_ASSERT(__kmp_barrier_release_branch_bits[bt]);
@@ -1543,6 +1588,7 @@ void __kmp_end_split_barrier(enum barrier_type bt, int gtid) {
                                      FALSE USE_ITT_BUILD_ARG(NULL));
       }
       }
+      LITHE_WAKE_BATCH_END();
       if (__kmp_tasking_mode != tskm_immediate_exec) {
         __kmp_task_team_sync(this_thr, team);
       } // if
@@ -1856,6 +1902,7 @@ void __kmp_fork_barrier(int gtid, int tid) {
     }
   } // master
 
+  LITHE_WAKE_BATCH_BEGIN();
   switch (__kmp_barrier_release_pattern[bs_forkjoin_barrier]) {
   case bp_hyper_bar: {
     KMP_ASSERT(__kmp_barrier_release_branch_bits[bs_forkjoin_barrier]);
@@ -1879,6 +1926,7 @@ void __kmp_fork_barrier(int gtid, int tid) {
                                  TRUE USE_ITT_BUILD_ARG(itt_sync_obj));
   }
   }
+  LITHE_WAKE_BATCH_END();
 
 #if OMPT_SUPPORT
   if (ompt_enabled.enabled &&

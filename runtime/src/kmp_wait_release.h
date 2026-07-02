@@ -21,6 +21,31 @@
 #include "ompt-specific.h"
 #endif
 
+#ifdef LIBOMP_USE_LITHE
+// Team-local inner-barrier spin policy. Defined in z_Linux_util.cpp.
+//   __kmp_lithe_inner_spin (LITHE_OMP_INNER_SPIN, default 1): at an intra-region
+//     (plain/reduction) barrier, HOLD the hart and hot-spin on the team-local
+//     b_go/b_arrived flag instead of cooperatively blocking on a lithe condvar
+//     (which parks the backing vcore via a parlib futex on EVERY barrier). 0
+//     restores the old always-cooperative-block behavior.
+//   __kmp_lithe_inner_spin_max (LITHE_OMP_INNER_SPIN_MAX, default 0): if >0,
+//     cap the inner hot-spin at N pause iterations, then fall through to the
+//     cooperative block (safety valve). 0 = unbounded (structural design point).
+extern "C" {
+extern int __kmp_lithe_inner_spin;
+extern kmp_uint64 __kmp_lithe_inner_spin_max;
+extern kmp_int64 __kmp_lithe_fork_spin_max;
+// Hot-team fork/join hot-spin (default path). See z_Linux_util.cpp.
+extern int __kmp_lithe_hot_team;
+extern int __kmp_lithe_hot_reserve;
+extern kmp_uint64 __kmp_lithe_hot_budget_init;
+extern kmp_uint64 __kmp_lithe_hot_budget_min;
+extern kmp_uint64 __kmp_lithe_hot_budget_max;
+int __kmp_lithe_fork_hot_ok(int nproc);
+void __kmp_lithe_inner_spin_config(void);
+}
+#endif
+
 /*!
 @defgroup WAIT_RELEASE Wait/Release operations
 
@@ -168,6 +193,25 @@ __kmp_wait_template(kmp_info_t *this_thr, C *flag,
 #if !KMP_USE_MONITOR
   kmp_uint64 poll_count;
   kmp_uint64 hibernate_goal;
+#endif
+#ifdef LIBOMP_USE_LITHE
+  kmp_uint64 lithe_inner_spins = 0;
+  __kmp_lithe_inner_spin_config();
+  // Hot-team fork/join hot-spin gate + per-thread adaptive budget. Computed
+  // once here (cheap) and consulted in the spin loop's fork/join branch.
+  int lithe_fork_hot = 0;
+  int lithe_did_block = 0;
+  kmp_uint64 lithe_fork_budget = 0;
+  if (!this_thr->th.th_lithe_barrier_inner) {
+    kmp_team_t *lt = this_thr->th.th_team;
+    int lnproc = lt ? lt->t.t_nproc : 1;
+    lithe_fork_hot = __kmp_lithe_fork_hot_ok(lnproc);
+    if (lithe_fork_hot) {
+      lithe_fork_budget = this_thr->th.th_lithe_fork_spin_budget;
+      if (lithe_fork_budget == 0)
+        lithe_fork_budget = __kmp_lithe_hot_budget_init;
+    }
+  }
 #endif
 
   KMP_FSYNC_SPIN_INIT(spin, NULL);
@@ -356,10 +400,59 @@ final_spin=FALSE)
     // KMP_YIELD(TCR_4(__kmp_nth) > __kmp_ncores);
     // Need performance improvement data to make the change...
 #ifdef LIBOMP_USE_LITHE
-    // Under Lithe cooperative scheduling, always yield the vcore immediately
-    // rather than burning it in a spin loop. Spinning wastes a vcore that
-    // another context could use.
-    KMP_YIELD(1);
+    // Under Lithe: the spin here must be a *cheap* cpu_relax that HOLDS the
+    // hart -- NOT lithe_context_yield(). KMP_YIELD(1) yields the hart back to
+    // the fork-join scheduler on every iteration, which re-enters hart_enter ->
+    // fjs_reactor_poll -> epoll_wait(0): an epoll storm and anti-scaling.
+    KMP_CPU_PAUSE();
+    // INNER (intra-region) barrier: keep spinning on the team-local flag while
+    // HOLDING the hart. The releaser's internal_release() is a plain atomic
+    // store this spinner observes (wake ~ns, like vanilla); because we never
+    // set the sleep bit and never call flag->suspend(), the release side's
+    // is_any_sleeping() is false -> no lithe_condvar_signal, no vcore unpark,
+    // no parlib futex. This removes the PER-BARRIER global-scheduler interaction
+    // (lithe_hart_request +/-1, FJS queue locks, vcore park/wake) that made
+    // lithified OpenMP anti-scale over CG's thousands of inner barriers.
+    //
+    // FORK/JOIN (region-boundary) barriers: bounded hot-spin holding the hart
+    // (LITHE_OMP_FORK_SPIN_MAX). miniFE-style codes re-fork a parallel region
+    // per operation, so the hot-team workers wait HERE between regions; parking
+    // (cooperative block) on every region is the futex park/wake storm that
+    // made lithified OpenMP anti-scale. We instead spin on the team-local flag
+    // (wake == atomic store) to bridge the rapid inter-region gap, then -- only
+    // if the gap is long (genuine MPI/serial idle) -- fall through to the
+    // cooperative block below, which returns the hart (lithe_hart_request(-1))
+    // to sibling schedulers (MPI/PMIx/UCX progress). Composition is preserved
+    // at this COARSE granularity, and the bound means this is NOT infinite
+    // hart hoarding.
+    if (this_thr->th.th_lithe_barrier_inner) {
+      if (__kmp_lithe_inner_spin &&
+          (__kmp_lithe_inner_spin_max == 0 ||
+           ++lithe_inner_spins < __kmp_lithe_inner_spin_max))
+        continue;
+    } else {
+      // FORK/JOIN (region-boundary) barrier.
+      // 1) Manual override (LITHE_OMP_FORK_SPIN_MAX != 0) takes precedence for
+      //    A/B experiments.
+      if (__kmp_lithe_fork_spin_max != 0) {
+        if (__kmp_lithe_fork_spin_max < 0 ||
+            ++lithe_inner_spins < (kmp_uint64)__kmp_lithe_fork_spin_max)
+          continue;
+      } else if (lithe_fork_hot) {
+        // 2) Default hot-team path: hold the hart and hot-spin on the team-local
+        //    go-flag so the next region's fork wakes us with a plain memory
+        //    write (like vanilla), NOT a parlib vcore park/wake + global hart
+        //    re-accounting. Bounded by the per-thread adaptive budget so a
+        //    genuinely long idle gap (e.g. an MPI exchange / serial phase
+        //    longer than the budget) falls through to the cooperative block,
+        //    returning the hart to sibling schedulers (MPI/PMIx/UCX progress).
+        if (++lithe_inner_spins < lithe_fork_budget)
+          continue;
+        // Budget exhausted: remember we are about to block so we shrink the
+        // budget on the way out (this gap was longer than worth spinning).
+        lithe_did_block = 1;
+      }
+    }
 #else
     if (oversubscribed) {
       KMP_YIELD(1);
@@ -428,6 +521,32 @@ final_spin=FALSE)
     }
     // TODO: If thread is done with work and times out, disband/free
   }
+
+#ifdef LIBOMP_USE_LITHE
+  // AIMD-adapt the per-thread fork/join hot-spin budget. If the release arrived
+  // within budget (we never had to cooperatively block), the inter-region gap
+  // was short -> spinning paid off; grow the budget (double, capped) so we stay
+  // hot through the same gap next time. If we exhausted the budget and blocked,
+  // the gap was long -> shrink (halve, floored) so we release the hart sooner
+  // next time. This keeps miniFE-style short-gap teams resident on their vcores
+  // (user-level memory-write wake) while long idle still returns harts for
+  // composition -- and the bound means it is never infinite hart hoarding.
+  if (lithe_fork_hot) {
+    kmp_uint64 b = this_thr->th.th_lithe_fork_spin_budget;
+    if (b == 0)
+      b = __kmp_lithe_hot_budget_init;
+    if (lithe_did_block) {
+      b = b / 2;
+      if (b < __kmp_lithe_hot_budget_min)
+        b = __kmp_lithe_hot_budget_min;
+    } else {
+      b = b ? b * 2 : __kmp_lithe_hot_budget_min;
+      if (b > __kmp_lithe_hot_budget_max)
+        b = __kmp_lithe_hot_budget_max;
+    }
+    this_thr->th.th_lithe_fork_spin_budget = b;
+  }
+#endif
 
 #if OMPT_SUPPORT
   omp_state_t ompt_exit_state = this_thr->th.ompt_thread_info.state;

@@ -2520,6 +2520,36 @@ typedef struct KMP_ALIGN_CACHE kmp_base_info {
 
 #ifdef LIBOMP_USE_LITHE
   void *th_lithe_ctx; // Lithe fork-join context for this worker (NULL for uber)
+  // Lazily-allocated {lithe_mutex_t, lithe_condvar_t} pair used by the lithe
+  // suspend/resume path so a thread waiting at a barrier cooperatively BLOCKS
+  // (frees its hart for MPI progress / other OpenMP work) instead of busy
+  // spin-yielding. See __kmp_suspend_template / __kmp_resume_template.
+  void *th_suspend_lithe_ctl;
+  // Allocated in __kmp_create_worker: a {lithe_mutex_t, lithe_condvar_t, int}
+  // the worker signals when it returns from __kmp_launch_worker. __kmp_reap_worker
+  // waits on it (the lithe analogue of pthread_join) so the worker's lithe
+  // context self-destroys exactly once -- the reaper must NOT also destroy it
+  // (that was a double-free racing the worker's own lithe_context_exit).
+  void *th_lithe_join_ctl;
+  // Set non-zero by __kmp_barrier (intra-region / plain / reduction barrier),
+  // zero for __kmp_fork_barrier / __kmp_join_barrier (parallel-region
+  // boundary). __kmp_wait_template reads it (lithe path) to decide whether to
+  // HOLD the hart and hot-spin on the team-local b_go/b_arrived flag (inner:
+  // wake == plain atomic store, no vcore park) or fall through to the
+  // cooperative lithe_condvar block that releases the hart for MPI/PMIx/UCX
+  // progress (fork/join: coarse-grained composition point). Per-worker (not
+  // __thread) so it is migration-safe across vcores.
+  int th_lithe_barrier_inner;
+  // Per-worker adaptive (AIMD) hot-spin budget for the FORK/JOIN barrier when
+  // the OMP team is "hot" (persistent across regions, see __kmp_lithe_hot_team
+  // and the sticky top fork-join sched). 0 => use the compiled/env default the
+  // first time. Grows when the release arrives within budget (worker stayed
+  // resident on its vcore -> wake was a plain memory write, no parlib park/
+  // wake, no global hart re-accounting), shrinks when the budget is exhausted
+  // and the worker cooperatively blocks (genuine long idle -> hart returned to
+  // sibling schedulers for MPI/PMIx/UCX progress). Bounded, so never the banned
+  // KMP_BLOCKTIME=infinite hart hoarding.
+  kmp_uint64 th_lithe_fork_spin_budget;
 #endif
 
   /* More stuff for keeping track of active/sleeping threads (this part is
