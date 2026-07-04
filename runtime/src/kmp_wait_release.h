@@ -43,6 +43,11 @@ extern kmp_uint64 __kmp_lithe_hot_budget_min;
 extern kmp_uint64 __kmp_lithe_hot_budget_max;
 int __kmp_lithe_fork_hot_ok(int nproc);
 void __kmp_lithe_inner_spin_config(void);
+// Inner-barrier liveness: donate the hart if a hart-less peer is waiting on the
+// current FJ sched (prevents hart-starvation livelock when OMP width > harts).
+// Returns 1 if it yielded (caller resumed), 0 if it kept spinning. See
+// z_Linux_util.cpp __kmp_lithe_inner_barrier_yield.
+int __kmp_lithe_inner_barrier_yield(kmp_info_t *th);
 }
 #endif
 
@@ -428,8 +433,17 @@ final_spin=FALSE)
     if (this_thr->th.th_lithe_barrier_inner) {
       if (__kmp_lithe_inner_spin &&
           (__kmp_lithe_inner_spin_max == 0 ||
-           ++lithe_inner_spins < __kmp_lithe_inner_spin_max))
+           ++lithe_inner_spins < __kmp_lithe_inner_spin_max)) {
+        // LIVENESS: the hot-spin above HOLDS this worker's hart. If OMP width
+        // exceeds the available harts (oversubscription / under-provisioned
+        // VCORE_LIMIT), hart-less peers sit RUNNABLE and can never reach this
+        // barrier -> hart-starvation livelock (full-node OMP=96/192 hang).
+        // Donate the hart when a hart-less peer is RUNNABLE (one atomic load when
+        // none are waiting). Required for oversubscribed teams (OMP>cores) at
+        // hierarchical reduction/release (BabelStream dot()).
+        (void)__kmp_lithe_inner_barrier_yield(this_thr);
         continue;
+      }
     } else {
       // FORK/JOIN (region-boundary) barrier.
       // 1) Manual override (LITHE_OMP_FORK_SPIN_MAX != 0) takes precedence for

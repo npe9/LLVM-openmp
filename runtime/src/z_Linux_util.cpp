@@ -84,6 +84,13 @@ extern "C" lithe_fork_join_sched_t *pmix_lithe_get_fork_join_sched(void)
  */
 int __kmp_lithe_inner_spin = 1;            /* LITHE_OMP_INNER_SPIN      */
 kmp_uint64 __kmp_lithe_inner_spin_max = 0; /* LITHE_OMP_INNER_SPIN_MAX  */
+/* Inner-barrier hart-donation (liveness). DEFAULT ON: while hot-spinning on the
+ * team-local inner-barrier flag, a worker donates its hart to any RUNNABLE-but-
+ * hartless peer so the barrier cannot livelock when OMP width exceeds the harts/
+ * vcores (oversubscription or under-provisioned VCORE_LIMIT). Set
+ * LITHE_OMP_INNER_YIELD=0 to reproduce the old (livelocking) unbounded-hoard
+ * behavior for A/B experiments only. */
+int __kmp_lithe_inner_yield = 1;           /* LITHE_OMP_INNER_YIELD     */
 kmp_int64 __kmp_lithe_fork_spin_max = 0; /* LITHE_OMP_FORK_SPIN_MAX (manual override) */
 /* Hot-team (persistent team kept across regions) fork/join hot-spin. This is
  * the DEFAULT path for miniFE-style codes that re-fork a parallel region per
@@ -158,6 +165,9 @@ extern "C" void __kmp_lithe_inner_spin_config(void) {
   e = getenv("LITHE_OMP_WARM_VCORES");
   if (e && *e)
     __kmp_lithe_warm_vcores = atoi(e);
+  e = getenv("LITHE_OMP_INNER_YIELD");
+  if (e && *e)
+    __kmp_lithe_inner_yield = atoi(e);
   if (__kmp_lithe_hot_budget_init < __kmp_lithe_hot_budget_min)
     __kmp_lithe_hot_budget_min = __kmp_lithe_hot_budget_init;
   if (__kmp_lithe_hot_budget_init > __kmp_lithe_hot_budget_max)
@@ -179,6 +189,45 @@ extern "C" int __kmp_lithe_fork_hot_ok(int nproc) {
   if (nproc < 1)
     nproc = 1;
   return max_vcores() >= nproc + __kmp_lithe_hot_reserve;
+}
+
+/* Inner-barrier liveness: a worker that hot-spins on the team-local
+ * b_go/b_arrived flag (INNER, i.e. plain/reduction barrier) HOLDS its hart. If
+ * the number of OpenMP worker contexts exceeds the available harts/vcores --
+ * real oversubscription (e.g. OMP=192 on a 96-core node) or an under-provisioned
+ * VCORE_LIMIT (< OMP width) -- the workers that got harts spin forever while the
+ * workers WITHOUT harts sit RUNNABLE on the fork-join sched's runqueue and can
+ * never reach the barrier. The barrier count never completes: a userspace
+ * hart-starvation LIVELOCK (no syscalls, "fewer kernel switches", the process
+ * hangs and must be reaped -- exactly the full-node OMP=96/192 symptom).
+ *
+ * Cure: while spinning, periodically check whether any peer is RUNNABLE but
+ * hart-less on the current FJ sched (lithe_fork_join_current_runnable_count() >
+ * 0). If so, cooperatively DONATE the hart with lithe_context_yield(): the
+ * spinner is re-enqueued and hart_enter dispatches a waiting peer, so every
+ * worker eventually gets a hart, reaches the barrier, and the count completes.
+ * This keeps the barrier a spin (no condvar/futex, no vcore park/wake) but makes
+ * it live under any width. lithe_context_yield stays WITHIN this FJ sched (it
+ * re-enters hart_enter, not the parent), and hart_enter's reactor poll is gated
+ * on pending fds, so there is no epoll storm for a pure-OMP team.
+ *
+ * At proper width every worker owns a hart, so runnable_count is 0 during the
+ * barrier and this never yields -- the fast atomic-store wake path is unchanged.
+ * Master and worker contexts both may yield when runnable_count > 0.
+ *
+ * Returns 1 if it yielded the hart (caller has been resumed), else 0. */
+extern "C" int __kmp_lithe_inner_barrier_yield(kmp_info_t *th) {
+  (void)th;
+  if (!__kmp_lithe_inner_yield)
+    return 0; /* A/B: LITHE_OMP_INNER_YIELD=0 restores the old hoard behavior */
+  if (lithe_fork_join_current_runnable_count() <= 0)
+    return 0; /* no hart-less peer waiting: keep the hart, hot-spin (fast path) */
+  /* Master and workers alike may hold a hart while hot-spinning; when any peer
+   * is RUNNABLE-but-hartless (threads > harts), the spinner must yield so the
+   * peer can run (hierarchical reduction/release, BabelStream dot() at OMP>cores).
+   * At proper width runnable_count==0 so this is a no-op aside from one load. */
+  lithe_context_yield(); /* donate hart to a waiting peer; resume here later */
+  return 1;
 }
 
 /* Per-thread cooperative suspend primitive. A thread that reaches its barrier
