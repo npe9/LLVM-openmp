@@ -104,17 +104,18 @@ kmp_int64 __kmp_lithe_fork_spin_max = 0; /* LITHE_OMP_FORK_SPIN_MAX (manual over
  * UCX progress (max_vcores() >= nproc + reserve), and only for a BOUNDED
  * adaptive budget so a genuinely long idle gap falls through to the cooperative
  * block that returns the hart. */
-/* DEFAULT OFF (measured): with the sticky persistent team (below) the dominant
- * per-region cost -- the master's lithe_sched_enter/exit hart-drain -- is gone,
- * and at that point cooperatively BLOCKING at the fork/join barrier beats
- * hot-spinning. Holding the hart and spinning keeps all OMP worker cores at
- * 100% through the master's (memory-bandwidth-bound) serial inter-region phase,
- * stealing bandwidth/turbo from the master; parking those cores (cooperative
- * block) is faster on miniFE node-scale (OMP=8: sticky+cooperative 23.5s vs
- * sticky+hot-spin 29.4s vs old per-region 40s). The mechanism is kept,
- * env-gated, for codes/allocations where spinning wins. */
-int __kmp_lithe_hot_team = 0;            /* LITHE_OMP_HOT_TEAM (default off) */
+/* DEFAULT OFF for hybrid (measured): with the sticky persistent team (below)
+ * the dominant per-region cost -- the master's lithe_sched_enter/exit hart-drain
+ * -- is gone, and at that point cooperatively BLOCKING at the fork/join barrier
+ * beats hot-spinning on miniFE (OMP=8: sticky+cooperative 23.5s vs sticky+hot-
+ * spin 29.4s). L1-B: when LITHE_OMP_HOT_TEAM is unset and the binary does not
+ * link pmix_lithe_get_fork_join_sched (pure OpenMP), __kmp_lithe_fork_hot_ok
+ * auto-enables hot-team with reserve 0 — BabelStream OMP=96 triad ~0.99× van.
+ * Explicit LITHE_OMP_HOT_TEAM=0/1 always wins; hybrid binaries stay OFF. */
+int __kmp_lithe_hot_team = 0;            /* LITHE_OMP_HOT_TEAM (default off for hybrid) */
+int __kmp_lithe_hot_team_env_set = 0;    /* 1 if LITHE_OMP_HOT_TEAM was set in env */
 int __kmp_lithe_hot_reserve = 1;         /* LITHE_OMP_HOT_RESERVE harts for progress */
+int __kmp_lithe_hot_reserve_env_set = 0;
 kmp_uint64 __kmp_lithe_hot_budget_init = 200000;  /* LITHE_OMP_HOT_BUDGET initial pause-iters */
 kmp_uint64 __kmp_lithe_hot_budget_min = 4096;
 kmp_uint64 __kmp_lithe_hot_budget_max = 4000000;
@@ -154,11 +155,15 @@ extern "C" void __kmp_lithe_inner_spin_config(void) {
   if (e && *e)
     __kmp_lithe_fork_spin_max = (kmp_int64)strtoll(e, NULL, 10);
   e = getenv("LITHE_OMP_HOT_TEAM");
-  if (e && *e)
+  if (e && *e) {
     __kmp_lithe_hot_team = atoi(e);
+    __kmp_lithe_hot_team_env_set = 1;
+  }
   e = getenv("LITHE_OMP_HOT_RESERVE");
-  if (e && *e)
+  if (e && *e) {
     __kmp_lithe_hot_reserve = atoi(e);
+    __kmp_lithe_hot_reserve_env_set = 1;
+  }
   e = getenv("LITHE_OMP_HOT_BUDGET");
   if (e && *e)
     __kmp_lithe_hot_budget_init = (kmp_uint64)strtoull(e, NULL, 10);
@@ -175,6 +180,15 @@ extern "C" void __kmp_lithe_inner_spin_config(void) {
   __atomic_store_n(&__kmp_lithe_inner_spin_inited, 1, __ATOMIC_RELEASE);
 }
 
+/* Pure-OMP (no MPI/OPAL host linked): weak pmix_lithe_get_fork_join_sched is
+ * NULL. If the symbol exists (hybrid binary), keep hybrid defaults even before
+ * MPI_Init so we never auto-enable hot-team for miniFE. Used by L1-B. */
+static int __kmp_lithe_is_pure_omp(void) {
+  if (pmix_lithe_get_fork_join_sched)
+    return 0;
+  return 1;
+}
+
 /* Gate: may a fork/join-barrier waiter hot-spin (hold its hart) instead of
  * cooperatively blocking? Only when hot-team is enabled and there is at least
  * __kmp_lithe_hot_reserve hart(s) beyond the team's worker count -- that spare
@@ -182,13 +196,25 @@ extern "C" void __kmp_lithe_inner_spin_config(void) {
  * while the OMP workers spin, so spinning does NOT starve progress at NP>1.
  * With the launcher's cpus-per-task = VCORE_LIMIT = OMP+2 this is satisfied
  * (2 spare harts). If the allocation is tight (max_vcores() <= nproc), fall
- * back to cooperative blocking. */
+ * back to cooperative blocking.
+ *
+ * L1-B auto path: when LITHE_OMP_HOT_TEAM is unset and there is no MPI/OPAL
+ * host (pure OpenMP), treat hot-team as ON with reserve 0 (no progress hart
+ * needed). Explicit LITHE_OMP_HOT_TEAM=0/1 always wins. Hybrid stays default
+ * OFF so miniFE is unchanged. */
 extern "C" int __kmp_lithe_fork_hot_ok(int nproc) {
-  if (!__kmp_lithe_hot_team)
+  int hot = __kmp_lithe_hot_team;
+  int reserve = __kmp_lithe_hot_reserve;
+  if (!__kmp_lithe_hot_team_env_set && __kmp_lithe_is_pure_omp()) {
+    hot = 1;
+    if (!__kmp_lithe_hot_reserve_env_set)
+      reserve = 0;
+  }
+  if (!hot)
     return 0;
   if (nproc < 1)
     nproc = 1;
-  return max_vcores() >= nproc + __kmp_lithe_hot_reserve;
+  return max_vcores() >= nproc + reserve;
 }
 
 /* Inner-barrier liveness: a worker that hot-spins on the team-local
