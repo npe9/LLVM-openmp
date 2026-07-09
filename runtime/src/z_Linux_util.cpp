@@ -536,6 +536,93 @@ extern "C" void __kmp_lithe_parallel_leave(kmp_team_t *team) {
   __kmp_lithe_fj_sp--;
   __kmp_lithe_region_depth = depth - 1;
 }
+
+/* Process teardown: sticky top FJ is entered once and never exited per region.
+ * After workers have been reaped (lithe_context_exit), master must sched_exit
+ * to drain idle FJS harts, then destroy the sticky FJ. Otherwise
+ * __kmp_reap_team / __kmp_cleanup frees OMP heap while hart_enter still runs
+ * on that sched (BabelStream SIGSEGV / exit 139 at OMP>=4). */
+extern "C" void __kmp_lithe_shutdown_sticky_fj(void) {
+  lithe_fork_join_sched_t *top;
+  lithe_sched_t *cur;
+
+  if (!__kmp_lithe_omp_top_fj && !__kmp_lithe_top_sticky &&
+      __kmp_lithe_fj_sp <= 0 && __kmp_lithe_region_depth <= 0)
+    return;
+
+  /* Nested per-region FJ first (if any remain), then sticky top. */
+  while (__kmp_lithe_fj_sp > 1) {
+    lithe_fork_join_sched_t *nested =
+        __kmp_lithe_fj_stack[__kmp_lithe_fj_sp - 1];
+    cur = lithe_sched_current();
+    if (nested && cur == (lithe_sched_t *)nested) {
+      lithe_sched_exit();
+    }
+    /* Skip destroy at process teardown (same race as sticky top). */
+    __kmp_lithe_fj_stack[__kmp_lithe_fj_sp - 1] = NULL;
+    __kmp_lithe_fj_team[__kmp_lithe_fj_sp - 1] = NULL;
+    __kmp_lithe_fj_sp--;
+  }
+
+  top = __kmp_lithe_omp_top_fj;
+  if (top) {
+    cur = lithe_sched_current();
+    /* Master should still be inside sticky FJ at process end. If not, re-enter
+     * so lithe_sched_exit can drain child harts (while(harts) yield). */
+    if (cur != (lithe_sched_t *)top) {
+      if (cur != NULL)
+        lithe_sched_enter((lithe_sched_t *)top);
+    }
+    cur = lithe_sched_current();
+    if (cur == (lithe_sched_t *)top) {
+      lithe_sched_exit();
+    }
+    /* Process teardown: do NOT destroy the sticky FJ. Destroy races idle
+     * vcores still finishing hart_return / MCS unlock after sched_exit's
+     * drain (SIGSEGV in mcs_pdr_lock). Leaking one FJ at exit is fine. */
+  }
+
+  __kmp_lithe_omp_top_fj = NULL;
+  __kmp_lithe_top_sticky = 0;
+  if (__kmp_lithe_fj_sp > 0) {
+    __kmp_lithe_fj_stack[0] = NULL;
+    __kmp_lithe_fj_team[0] = NULL;
+  }
+  __kmp_lithe_fj_sp = 0;
+  __kmp_lithe_region_depth = 0;
+}
+
+
+/* Called from __kmp_internal_end before joining workers: move parked worker
+ * contexts off the sticky OMP FJ onto the root parent, then sched_exit sticky
+ * so idle FJS harts drain. Workers then exit on the parent (no MCS race). */
+extern "C" void __kmp_lithe_prepare_teardown_workers(kmp_info_t *pool_head) {
+  lithe_fork_join_sched_t *parent_fj = NULL;
+
+  if (!__kmp_lithe_omp_top_fj && !__kmp_lithe_top_sticky &&
+      __kmp_lithe_fj_sp <= 0)
+    return;
+
+  parent_fj = __kmp_lithe_opal_sched();
+  if (parent_fj) {
+    for (kmp_info_t *thread = pool_head; thread != NULL;
+         thread = CCAST(kmp_info_t *, thread->th.th_next_pool)) {
+      if (!thread->th.th_lithe_ctx)
+        continue;
+      lithe_fork_join_context_t *wctx =
+          (lithe_fork_join_context_t *)thread->th.th_lithe_ctx;
+      lithe_fork_join_sched_t *from =
+          (lithe_fork_join_sched_t *)wctx->context.sched;
+      if (from && from != parent_fj)
+        lithe_fork_join_context_migrate(from, parent_fj, wctx);
+    }
+  }
+
+  /* Drain idle sticky harts before workers lithe_context_exit. Skip destroy. */
+  __kmp_lithe_shutdown_sticky_fj();
+}
+
+
 #endif /* LIBOMP_USE_LITHE */
 
 #if !KMP_OS_FREEBSD && !KMP_OS_NETBSD

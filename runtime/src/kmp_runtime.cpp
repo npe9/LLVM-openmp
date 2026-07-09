@@ -46,6 +46,8 @@
 extern "C" void __kmp_lithe_ensure_bootstrap(void);
 extern "C" void __kmp_lithe_parallel_sched_begin(kmp_team_t *team);
 extern "C" void __kmp_lithe_parallel_leave(kmp_team_t *team);
+extern "C" void __kmp_lithe_shutdown_sticky_fj(void);
+extern "C" void __kmp_lithe_prepare_teardown_workers(kmp_info_t *pool_head);
 #endif
 
 #if defined(KMP_GOMP_COMPAT)
@@ -5969,6 +5971,50 @@ static void __kmp_internal_end(void) {
 
     // Reap the worker threads.
     // This is valid for now, but be careful if threads are reaped sooner.
+#if defined(LIBOMP_USE_LITHE)
+    /* Lithe sticky-FJ teardown: migrate parked workers to parent root, drain
+     * sticky idle harts via sched_exit, then join+free workers on parent. */
+    {
+      kmp_info_t *pool_head = CCAST(kmp_info_t *, __kmp_thread_pool);
+      __kmp_lithe_prepare_teardown_workers(pool_head);
+
+      kmp_info_t *joined = NULL;
+      while (__kmp_thread_pool != NULL) {
+        kmp_info_t *thread = CCAST(kmp_info_t *, __kmp_thread_pool);
+        __kmp_thread_pool = thread->th.th_next_pool;
+        KMP_DEBUG_ASSERT(thread->th.th_reap_state == KMP_SAFE_TO_REAP);
+        thread->th.th_next_pool = NULL;
+        thread->th.th_in_pool = FALSE;
+        {
+          int gtid = thread->th.th_info.ds.ds_gtid;
+          KA_TRACE(20, ("__kmp_internal_end: lithe join-pass T#%d\n", gtid));
+          ANNOTATE_HAPPENS_BEFORE(thread);
+          kmp_flag_64 flag(&thread->th.th_bar[bs_forkjoin_barrier].bb.b_go,
+                           thread);
+          __kmp_release_64(&flag);
+        }
+        __kmp_reap_worker(thread);
+        if (thread->th.th_active_in_pool) {
+          thread->th.th_active_in_pool = FALSE;
+          if (KMP_ATOMIC_LD_RLX(&__kmp_thread_pool_active_nth) > 0)
+            KMP_ATOMIC_DEC(&__kmp_thread_pool_active_nth);
+        }
+        if (__kmp_thread_pool_nth > 0)
+          --__kmp_thread_pool_nth;
+        thread->th.th_next_pool = joined;
+        joined = thread;
+      }
+      __kmp_thread_pool_insert_pt = NULL;
+
+      while (joined != NULL) {
+        kmp_info_t *thread = joined;
+        joined = thread->th.th_next_pool;
+        thread->th.th_next_pool = NULL;
+        __kmp_reap_thread(thread, /*is_root=*/1);
+      }
+    }
+
+#else
     while (__kmp_thread_pool != NULL) { // Loop thru all the thread in the pool.
       // Get the next thread from the pool.
       kmp_info_t *thread = CCAST(kmp_info_t *, __kmp_thread_pool);
@@ -5980,6 +6026,7 @@ static void __kmp_internal_end(void) {
       __kmp_reap_thread(thread, 0);
     }
     __kmp_thread_pool_insert_pt = NULL;
+#endif
 
     // Reap teams.
     while (__kmp_team_pool != NULL) { // Loop thru all the teams in the pool.
