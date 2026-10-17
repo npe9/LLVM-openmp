@@ -4602,6 +4602,24 @@ static void __kmp_aux_affinity_initialize(void) {
 #undef KMP_EXIT_AFF_NONE
 
 void __kmp_affinity_initialize(void) {
+#ifdef LIBOMP_USE_LITHE
+  // Under Lithe the OpenMP "threads" are Lithe contexts multiplexed on parlib's
+  // vcore threads, and parlib owns their CPU placement (one vcore per CPU of
+  // the inherited cpuset). libomp's default binding ("respect" the initial
+  // thread's mask) saw the master's single-CPU vcore mask as the whole machine
+  // and bound every worker's *current vcore thread* onto that one CPU: two
+  // hot-spinning harts on CPU 0 time-slicing in 4 ms kernel ticks, 1000x per
+  // region (2026-10-16, docs/AUDIT_SYMBOLS_COMPARABILITY_20261016.md).
+  // OMP_PROC_BIND=false does NOT prevent it; KMP_AFFINITY=disabled does, so
+  // make that the only behaviour: libomp never touches OS-thread affinity here.
+  // Both halves of what KMP_AFFINITY=disabled does: the type AND the mask size
+  // (KMP_AFFINITY_DISABLE zeroes __kmp_affin_mask_size, which is what turns
+  // every __kmp_set_system_affinity into a no-op; the type alone still let
+  // __kmp_aux_affinity_initialize build a full mask from the master's vcore
+  // CPU and bind the workers to it -- measured 2026-10-16, all threads on CPU 0).
+  __kmp_affinity_type = affinity_disabled;
+  KMP_AFFINITY_DISABLE();
+#endif
   // Much of the code above was written assumming that if a machine was not
   // affinity capable, then __kmp_affinity_type == affinity_none.  We now
   // explicitly represent this as __kmp_affinity_type == affinity_disabled.

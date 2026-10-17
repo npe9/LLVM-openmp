@@ -12,6 +12,24 @@
 //===----------------------------------------------------------------------===//
 
 #include "kmp.h"
+
+#ifdef LIBOMP_USE_LITHE
+#include <lithe/sched_trace.h>
+/* Perfetto trace points (lithe-docker docs/PLAN-perfetto-lithe.md 2.4):
+ * scope guards so every return path closes its slice. No-ops unless
+ * LITHE_SCHED_TRACE=1. */
+struct KmpLitheTraceScope {
+  uint8_t end_ev; uint32_t ctx; bool on;
+  KmpLitheTraceScope(uint8_t begin_ev, uint8_t end_ev_, uint32_t ctx_, int32_t aux)
+      : end_ev(end_ev_), ctx(ctx_), on(lithe_sched_trace_enabled() != 0) {
+    if (on && begin_ev) lithe_sched_trace_emit(begin_ev, NULL, ctx, 0, aux);
+  }
+  ~KmpLitheTraceScope() { if (on && end_ev) lithe_sched_trace_emit(end_ev, NULL, ctx, 0, 0); }
+};
+#define KMP_LITHE_TRACE_SCOPE(var, b, e, ctx, aux) KmpLitheTraceScope var((b), (e), (uint32_t)(ctx), (int32_t)(aux))
+#else
+#define KMP_LITHE_TRACE_SCOPE(var, b, e, ctx, aux) do {} while (0)
+#endif
 #include "kmp_wait_release.h"
 #include "kmp_itt.h"
 #include "kmp_os.h"
@@ -1260,6 +1278,7 @@ int __kmp_barrier(enum barrier_type bt, int gtid, int is_split,
                   size_t reduce_size, void *reduce_data,
                   void (*reduce)(void *, void *)) {
   KMP_TIME_PARTITIONED_BLOCK(OMP_plain_barrier);
+  KMP_LITHE_TRACE_SCOPE(_lt_bar, LITHE_ST_OMP_BARRIER_BEGIN, LITHE_ST_OMP_BARRIER_END, gtid, (bt == bs_reduction_barrier) ? 2 : 0);
   KMP_SET_THREAD_STATE_BLOCK(PLAIN_BARRIER);
   int tid = __kmp_tid_from_gtid(gtid);
   kmp_info_t *this_thr = __kmp_threads[gtid];
@@ -1598,6 +1617,7 @@ void __kmp_end_split_barrier(enum barrier_type bt, int gtid) {
 }
 
 void __kmp_join_barrier(int gtid) {
+  KMP_LITHE_TRACE_SCOPE(_lt_jbar, LITHE_ST_OMP_BARRIER_BEGIN, LITHE_ST_OMP_BARRIER_END, gtid, 1);
   KMP_TIME_PARTITIONED_BLOCK(OMP_join_barrier);
   KMP_SET_THREAD_STATE_BLOCK(FORK_JOIN_BARRIER);
   kmp_info_t *this_thr = __kmp_threads[gtid];
@@ -1835,6 +1855,7 @@ void __kmp_join_barrier(int gtid) {
 // TODO release worker threads' fork barriers as we are ready instead of all at
 // once
 void __kmp_fork_barrier(int gtid, int tid) {
+  KMP_LITHE_TRACE_SCOPE(_lt_fbar, LITHE_ST_OMP_BARRIER_BEGIN, LITHE_ST_OMP_BARRIER_END, gtid, 1);
   KMP_TIME_PARTITIONED_BLOCK(OMP_fork_barrier);
   KMP_SET_THREAD_STATE_BLOCK(FORK_JOIN_BARRIER);
   kmp_info_t *this_thr = __kmp_threads[gtid];

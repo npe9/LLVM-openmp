@@ -4,6 +4,7 @@
  */
 
 #include <cstdio>
+#include <lithe/sched_trace.h>
 #include <cstdlib>
 #include "kmp_lithe.h"
 #include "kmp_i18n.h"
@@ -38,6 +39,16 @@ static int __kmp_lithe_initialized = 0;
 extern "C" int
 __kmp_invoke_microtask(microtask_t pkfn, int gtid, int npr, int argc, void *p_argv[],
                        void **exit_frame) {
+  /* Perfetto trace point: one "run" slice per thread per region, primary
+   * included (the primary's microtask is invoked from here as well). */
+  struct RunScope {
+    int gtid; bool on;
+    RunScope(int g, int t) : gtid(g), on(lithe_sched_trace_enabled() != 0) {
+      if (on) lithe_sched_trace_emit(LITHE_ST_OMP_RUN_BEGIN, NULL, (uint32_t)gtid, 0, (int32_t)t);
+    }
+    ~RunScope() { if (on) lithe_sched_trace_emit(LITHE_ST_OMP_RUN_END, NULL, (uint32_t)gtid, 0, 0); }
+  } _lt_run(gtid, npr);
+
     if (exit_frame)
         *exit_frame = NULL;
     void **a = p_argv;

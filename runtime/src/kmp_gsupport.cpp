@@ -12,6 +12,23 @@
 //===----------------------------------------------------------------------===//
 
 #include "kmp.h"
+
+#ifdef LIBOMP_USE_LITHE
+#include <lithe/sched_trace.h>
+/* Perfetto trace point for the primary thread's share of a GOMP-ABI region:
+ * with fork_context_gnu, __kmp_fork_call returns before invoking the
+ * microtask and the GOMP entry point calls task(data) itself. */
+struct GompLitheRunScope {
+  int gtid; bool on;
+  GompLitheRunScope(int g) : gtid(g), on(lithe_sched_trace_enabled() != 0) {
+    if (on) lithe_sched_trace_emit(LITHE_ST_OMP_RUN_BEGIN, NULL, (uint32_t)gtid, 0, 0);
+  }
+  ~GompLitheRunScope() { if (on) lithe_sched_trace_emit(LITHE_ST_OMP_RUN_END, NULL, (uint32_t)gtid, 0, 0); }
+};
+#define GOMP_LITHE_RUN(task_call) do { GompLitheRunScope _lt_run(__kmp_get_gtid()); task_call; } while (0)
+#else
+#define GOMP_LITHE_RUN(task_call) do { task_call; } while (0)
+#endif
 #include "kmp_atomic.h"
 
 #if OMPT_SUPPORT
@@ -612,6 +629,15 @@ LOOP_NEXT(KMP_EXPAND_NAME(KMP_API_NAME_GOMP_LOOP_DYNAMIC_NEXT), {})
 LOOP_START(KMP_EXPAND_NAME(KMP_API_NAME_GOMP_LOOP_GUIDED_START),
            kmp_sch_guided_chunked)
 LOOP_NEXT(KMP_EXPAND_NAME(KMP_API_NAME_GOMP_LOOP_GUIDED_NEXT), {})
+// GOMP_4.5 "nonmonotonic" loop entry points (2026-10-16): gcc >= 9 emits these
+// for schedule(dynamic|guided) without an explicit monotonic modifier; this
+// libomp predates them, so gcc-compiled LAMMPS and GROMACS failed to link
+// (undefined GOMP_loop_nonmonotonic_dynamic_start/next). Same semantics as the
+// monotonic versions, which is what newer LLVM does too.
+LOOP_START(KMP_EXPAND_NAME(KMP_API_NAME_GOMP_LOOP_NONMONOTONIC_DYNAMIC_START), kmp_sch_dynamic_chunked)
+LOOP_NEXT(KMP_EXPAND_NAME(KMP_API_NAME_GOMP_LOOP_NONMONOTONIC_DYNAMIC_NEXT), {})
+LOOP_START(KMP_EXPAND_NAME(KMP_API_NAME_GOMP_LOOP_NONMONOTONIC_GUIDED_START), kmp_sch_guided_chunked)
+LOOP_NEXT(KMP_EXPAND_NAME(KMP_API_NAME_GOMP_LOOP_NONMONOTONIC_GUIDED_NEXT), {})
 LOOP_RUNTIME_START(KMP_EXPAND_NAME(KMP_API_NAME_GOMP_LOOP_RUNTIME_START),
                    kmp_sch_runtime)
 LOOP_NEXT(KMP_EXPAND_NAME(KMP_API_NAME_GOMP_LOOP_RUNTIME_NEXT), {})
@@ -1166,7 +1192,7 @@ void KMP_EXPAND_NAME(KMP_API_NAME_GOMP_PARALLEL)(void (*task)(void *),
     task_info->frame.exit_frame = OMPT_GET_FRAME_ADDRESS(0);
   }
 #endif
-  task(data);
+  GOMP_LITHE_RUN(task(data));
 #if OMPT_SUPPORT
   if (ompt_enabled.enabled) {
     OMPT_STORE_RETURN_ADDRESS(gtid);
@@ -1215,7 +1241,7 @@ void KMP_EXPAND_NAME(KMP_API_NAME_GOMP_PARALLEL_SECTIONS)(void (*task)(void *),
 
   KMP_DISPATCH_INIT(&loc, gtid, kmp_nm_dynamic_chunked, 1, count, 1, 1, TRUE);
 
-  task(data);
+  GOMP_LITHE_RUN(task(data));
   KMP_EXPAND_NAME(KMP_API_NAME_GOMP_PARALLEL_END)();
   KA_TRACE(20, ("GOMP_parallel_sections exit: T#%d\n", gtid));
 }
@@ -1249,7 +1275,7 @@ void KMP_EXPAND_NAME(KMP_API_NAME_GOMP_PARALLEL_SECTIONS)(void (*task)(void *),
     KMP_DISPATCH_INIT(&loc, gtid, (schedule), lb,                              \
                       (str > 0) ? (ub - 1) : (ub + 1), str, chunk_sz,          \
                       (schedule) != kmp_sch_static);                           \
-    task(data);                                                                \
+    GOMP_LITHE_RUN(task(data));                                                                \
     KMP_EXPAND_NAME(KMP_API_NAME_GOMP_PARALLEL_END)();                         \
     ompt_post();                                                               \
                                                                                \
@@ -1656,6 +1682,10 @@ KMP_VERSION_SYMBOL(KMP_API_NAME_GOMP_TEAMS, 40, "GOMP_4.0");
 #if OMP_45_ENABLED
 KMP_VERSION_SYMBOL(KMP_API_NAME_GOMP_TASKLOOP, 45, "GOMP_4.5");
 KMP_VERSION_SYMBOL(KMP_API_NAME_GOMP_TASKLOOP_ULL, 45, "GOMP_4.5");
+KMP_VERSION_SYMBOL(KMP_API_NAME_GOMP_LOOP_NONMONOTONIC_DYNAMIC_START, 45, "GOMP_4.5");
+KMP_VERSION_SYMBOL(KMP_API_NAME_GOMP_LOOP_NONMONOTONIC_DYNAMIC_NEXT, 45, "GOMP_4.5");
+KMP_VERSION_SYMBOL(KMP_API_NAME_GOMP_LOOP_NONMONOTONIC_GUIDED_START, 45, "GOMP_4.5");
+KMP_VERSION_SYMBOL(KMP_API_NAME_GOMP_LOOP_NONMONOTONIC_GUIDED_NEXT, 45, "GOMP_4.5");
 #endif
 
 #endif // KMP_USE_VERSION_SYMBOLS

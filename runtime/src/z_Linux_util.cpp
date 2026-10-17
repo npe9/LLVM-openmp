@@ -27,6 +27,7 @@
 #define typeof __typeof__
 #endif
 #include <lithe/lithe.h>
+#include <lithe/sched_trace.h>
 #include <lithe/fork_join_sched.h>
 #include <lithe/mutex.h>
 #include <lithe/condvar.h>
@@ -91,6 +92,43 @@ kmp_uint64 __kmp_lithe_inner_spin_max = 0; /* LITHE_OMP_INNER_SPIN_MAX  */
  * LITHE_OMP_INNER_YIELD=0 to reproduce the old (livelocking) unbounded-hoard
  * behavior for A/B experiments only. */
 int __kmp_lithe_inner_yield = 1;           /* LITHE_OMP_INNER_YIELD     */
+/* Fork/join-barrier hart donation (2026-10-15, LITHE_OMP_FORK_YIELD, default
+ * 0 for A/B). The inner barrier above donates its hart to a RUNNABLE-but-
+ * hartless peer; the fork/join (region-boundary) hot-spin did not. In the
+ * hosted model the peer is usually this worker's own MASTER (a logical MPI
+ * rank) queued on the same OMP fork-join sched: hosted miniFE RPH=4 x OMP=2 on
+ * VCORE_LIMIT=3 stalled in make_local_matrix with each OMP child sched showing
+ * harts=1 runnable=1 and its hart running a worker in __kmp_wait_template at
+ * bs_forkjoin_barrier. The master cannot reach the next fork (or progress MPI)
+ * until the worker exhausts its hot budget AND KMP_BLOCKTIME (200 ms) -- per
+ * region gap. KMP_BLOCKTIME=0 made the run complete, which is the confirming
+ * A/B; this is the targeted version that keeps the hot spin when nobody waits.
+ *
+ * NEGATIVE RESULT, measured the same day (login node, RPH=4 x OMP=2, NX16,
+ * LITHE_OMP_FLAT=1): runs complete but CG takes 17-21 s vs 0.3-0.5 s with
+ * KMP_BLOCKTIME=0 and this OFF -- donating on every spin iteration is a yield
+ * storm. Leave it off; use KMP_BLOCKTIME=0 with LITHE_OMP_FLAT=1 instead. */
+int __kmp_lithe_fork_yield = 0;            /* LITHE_OMP_FORK_YIELD      */
+/* DEMAND BLOCK (2026-10-16, LITHE_OMP_DEMAND_BLOCK; unset = on iff
+ * LITHE_OMP_FLAT=1, explicit 0/1 wins). The two region-boundary policies above
+ * are both wrong under hart scarcity, in opposite directions:
+ *   - the default (no hot-team, hybrid binary) spins KMP_BLOCKTIME (200 ms)
+ *     holding the hart before it parks, while its own master sits RUNNABLE
+ *     and hartless on the same runqueue -> flat mode "slow, not hung"
+ *     (RPH=4 x OMP=2 on 3 harts: CG 0.4 s with KMP_BLOCKTIME=0, far worse
+ *     without);
+ *   - LITHE_OMP_FORK_YIELD donates the hart but stays RUNNABLE, so the worker
+ *     is re-dispatched, finds the flag still clear, yields again: a FIFO
+ *     storm with every worker in it (CG 17-21 s).
+ * Demand block is the third option: spin hot while NOBODY on this scheduler
+ * is runnable-but-hartless (one atomic load per iteration, same probe as the
+ * inner barrier), and the moment somebody is, go straight to the cooperative
+ * block -- skip the blocktime poll -- so the hart changes hands exactly once
+ * and the worker is NOT runnable until the next fork releases it. On an
+ * exclusive node with harts >= contexts the runqueue is empty between regions
+ * and this degenerates to the hot spin (memory-write wake, no park); on a
+ * scarce node it degenerates to KMP_BLOCKTIME=0 without having to set it. */
+int __kmp_lithe_demand_block = -1;         /* LITHE_OMP_DEMAND_BLOCK    */
 kmp_int64 __kmp_lithe_fork_spin_max = 0; /* LITHE_OMP_FORK_SPIN_MAX (manual override) */
 /* Hot-team (persistent team kept across regions) fork/join hot-spin. This is
  * the DEFAULT path for miniFE-style codes that re-fork a parallel region per
@@ -173,6 +211,12 @@ extern "C" void __kmp_lithe_inner_spin_config(void) {
   e = getenv("LITHE_OMP_INNER_YIELD");
   if (e && *e)
     __kmp_lithe_inner_yield = atoi(e);
+  e = getenv("LITHE_OMP_FORK_YIELD");
+  if (e && *e)
+    __kmp_lithe_fork_yield = atoi(e);
+  e = getenv("LITHE_OMP_DEMAND_BLOCK");
+  if (e && *e)
+    __kmp_lithe_demand_block = atoi(e);
   if (__kmp_lithe_hot_budget_init < __kmp_lithe_hot_budget_min)
     __kmp_lithe_hot_budget_min = __kmp_lithe_hot_budget_init;
   if (__kmp_lithe_hot_budget_init > __kmp_lithe_hot_budget_max)
@@ -242,11 +286,37 @@ extern "C" int __kmp_lithe_fork_hot_ok(int nproc) {
  * Master and worker contexts both may yield when runnable_count > 0.
  *
  * Returns 1 if it yielded the hart (caller has been resumed), else 0. */
+/* IDLE-AWARE PEER CHECK (LITHE_OMP_IDLE_AWARE, 2026-10-16, GAPS C11 part 2).
+ * The three "is a peer runnable-but-hartless" tests in this file and in
+ * kmp_wait_release.h used lithe_fork_join_current_runnable_count() > 0, which
+ * is also true when a RUNNABLE peer is about to be picked up by an IDLE hart
+ * of our own sched. GROMACS PME at NP=2 (MPI_Alltoall inside a parallel
+ * region: the primary yields in opal_progress_block while the workers sit at
+ * an omp barrier) then made every worker yield on every spin (63k/s), and
+ * with a spare hart the four contexts rotated over five harts: 191 vs 296
+ * ns/day at 4 harts. lithe_fork_join_current_hartless_runnable() subtracts
+ * the idle owned harts. Weak: hosted binaries embed an older liblithe.a
+ * until relinked; then fall back to the raw count. */
+extern "C" long lithe_fork_join_current_hartless_runnable(void)
+    __attribute__((weak));
+extern "C" long __kmp_lithe_hartless_peers(void) {
+  static int idle_aware = -1;
+  if (__builtin_expect(idle_aware < 0, 0)) {
+    const char *e = getenv("LITHE_OMP_IDLE_AWARE");
+    idle_aware = e ? atoi(e) : 0;
+    if (idle_aware && &lithe_fork_join_current_hartless_runnable == NULL)
+      idle_aware = 0; /* old liblithe without the symbol */
+  }
+  if (idle_aware)
+    return lithe_fork_join_current_hartless_runnable();
+  return lithe_fork_join_current_runnable_count();
+}
+
 extern "C" int __kmp_lithe_inner_barrier_yield(kmp_info_t *th) {
   (void)th;
   if (!__kmp_lithe_inner_yield)
     return 0; /* A/B: LITHE_OMP_INNER_YIELD=0 restores the old hoard behavior */
-  if (lithe_fork_join_current_runnable_count() <= 0)
+  if (__kmp_lithe_hartless_peers() <= 0)
     return 0; /* no hart-less peer waiting: keep the hart, hot-spin (fast path) */
   /* Master and workers alike may hold a hart while hot-spinning; when any peer
    * is RUNNABLE-but-hartless (threads > harts), the spinner must yield so the
@@ -390,7 +460,55 @@ static void __kmp_lithe_rebind_ctx(lithe_fork_join_context_t *ctx,
   lithe_fork_join_context_migrate(from, to, ctx);
 }
 
+/* FLAT MODE (2026-10-15, LITHE_OMP_FLAT=1, default 0 for A/B).
+ *
+ * The default nests one sticky OMP fork-join scheduler under every context that
+ * opens a region. In the hosted model that is one child per logical MPI rank,
+ * so harts must move SIDEWAYS between sibling children through the rank
+ * scheduler, and every such path has its own starvation mode (ticket-lock
+ * convoy, empty-child idle park, worker hot-spin over a runnable master).
+ * Login-node sweep: RPH=4 x OMP=2 worked only at VCORE_LIMIT >= ~6, RPH=2 x
+ * OMP=2 everywhere; the serial build (all ranks on ONE runqueue) works at
+ * VCORE_LIMIT=3.
+ *
+ * Flat mode runs a region's workers on the scheduler the master is ALREADY in
+ * (it must be a fork-join scheduler), so ranks and OMP workers share one FIFO
+ * runqueue and a blocked rank's hart serves whatever is runnable next. No
+ * sched_enter/exit, no child registration, nothing to release but the workers
+ * themselves (omp_lithe_context_release moves this context's team off the
+ * rank scheduler so its join_all can complete). */
+static int __kmp_lithe_flat = -1;
+extern "C" int __kmp_lithe_flat_on(void) {
+  if (__kmp_lithe_flat < 0) {
+    const char *e = getenv("LITHE_OMP_FLAT");
+    __kmp_lithe_flat = (e && e[0] == '1') ? 1 : 0;
+  }
+  return __kmp_lithe_flat;
+}
+/* Demand block (see __kmp_lithe_demand_block above): explicit env wins, else
+ * on exactly when flat mode is. Resolved once; the result is cached. */
+extern "C" int __kmp_lithe_demand_block_on(void) {
+  if (__kmp_lithe_demand_block < 0) {
+    __kmp_lithe_inner_spin_config();
+    if (__kmp_lithe_demand_block < 0)
+      __kmp_lithe_demand_block = __kmp_lithe_flat_on();
+  }
+  return __kmp_lithe_demand_block;
+}
+static lithe_fork_join_sched_t *__kmp_lithe_flat_sched(void) {
+  lithe_sched_t *cur = lithe_sched_current();
+  if (cur && cur->funcs == &lithe_fork_join_sched_funcs)
+    return (lithe_fork_join_sched_t *)cur;
+  return NULL;
+}
+static __thread kmp_team_t *__kmp_lithe_flat_team;
+
 extern "C" lithe_fork_join_sched_t *__kmp_lithe_worker_sched_for_create(void) {
+  if (__kmp_lithe_flat_on()) {
+    lithe_fork_join_sched_t *f = __kmp_lithe_flat_sched();
+    if (f)
+      return f;
+  }
   if (__kmp_lithe_fj_sp > 0)
     return __kmp_lithe_fj_stack[__kmp_lithe_fj_sp - 1];
   return __kmp_lithe_opal_sched();
@@ -434,6 +552,17 @@ extern "C" void __kmp_lithe_parallel_sched_begin(kmp_team_t *team) {
   opal = __kmp_lithe_opal_sched();
   if (!opal)
     return;
+
+  if (__kmp_lithe_flat_on()) {
+    lithe_fork_join_sched_t *f = __kmp_lithe_flat_sched();
+    if (f) {
+      int runnable_migrated = __kmp_lithe_migrate_workers(team, f, NULL);
+      __kmp_lithe_flat_team = team;
+      if (runnable_migrated > 0)
+        lithe_hart_request(runnable_migrated);
+      return;
+    }
+  }
 
   int depth = __kmp_lithe_region_depth; /* active regions BEFORE this one */
 
@@ -500,6 +629,8 @@ extern "C" void __kmp_lithe_parallel_leave(kmp_team_t *team) {
 
   if (!team || team->t.t_nproc <= 1)
     return;
+  if (__kmp_lithe_flat_on() && __kmp_lithe_region_depth <= 0)
+    return; /* flat: no per-region scheduler to unwind */
   if (__kmp_lithe_region_depth <= 0)
     return;
 
@@ -592,6 +723,100 @@ extern "C" void __kmp_lithe_shutdown_sticky_fj(void) {
   __kmp_lithe_region_depth = 0;
 }
 
+
+/* PER-CONTEXT RELEASE of the sticky top-level OMP fork-join scheduler.
+ * ---------------------------------------------------------------------------
+ * The sticky design above is right for a classic MPI+OpenMP process: the master
+ * thread lives until exit, so entering the top OMP FJ once and unwinding it in
+ * __kmp_internal_end costs nothing and saves a per-region hart drain.
+ *
+ * It is WRONG for the hosted model, where a logical rank is a transient Lithe
+ * CONTEXT. Such a context opens a parallel region, libomp enters the sticky
+ * OMP FJ on it and never exits, and then the context RETURNS -- still inside a
+ * child scheduler. The child stays registered on its parent with granted=1 and
+ * harts=0, so base_child_exited() spins forever waiting for a hart nobody
+ * owns and the application's own lithe_sched_exit() never returns. libomp's
+ * unwind runs from __kmp_internal_end, i.e. at PROCESS teardown -- strictly
+ * after the application has already tried to exit its scheduler. The lifetimes
+ * are inverted.
+ *
+ * Measured 2026-10-14 with a minimal reproducer (.build_logs/ompctx/repro.c):
+ * ONE region of ONE thread in ONE context computes the right answer and then
+ * hangs in teardown; the no-OpenMP control arm exits cleanly.
+ *
+ * Since the sticky state is per-uthread TLS (and parlib gives every Lithe
+ * context its own TLS), the unwind is per-context too. A context that used
+ * OpenMP calls this before it returns, and leaves as it arrived.
+ *
+ * Deliberately NOT destroyed: the sticky FJ still owns this context's parked
+ * OMP worker contexts, and libomp's thread pool (__kmp_thread_pool) is
+ * process-wide -- a later region on another context migrates those same
+ * workers onto its own sched via __kmp_lithe_migrate_workers. Destroying here
+ * would free scheduler state that kmp_info_t still points at. Exiting is what
+ * releases the harts and deregisters the child, which is what the parent needs;
+ * the FJ struct itself is reclaimed at process teardown. */
+extern "C" void omp_lithe_context_release(void) {
+  lithe_fork_join_sched_t *top;
+  lithe_sched_t *cur;
+
+  if (__kmp_lithe_flat_on() && __kmp_lithe_flat_team) {
+    /* Flat: this context's workers live on the scheduler it is about to leave
+     * (the rank FJS). Park them on the OPAL root so the rank FJS's join_all
+     * can reach num_contexts == 0; the next region anywhere migrates them back
+     * through __kmp_lithe_migrate_workers. */
+    lithe_fork_join_sched_t *f = __kmp_lithe_flat_sched();
+    lithe_fork_join_sched_t *opal = __kmp_lithe_opal_sched();
+    if (f && opal && f != opal)
+      (void)__kmp_lithe_migrate_workers(__kmp_lithe_flat_team, opal, f);
+    __kmp_lithe_flat_team = NULL;
+  }
+
+  if (!__kmp_lithe_omp_top_fj && !__kmp_lithe_top_sticky &&
+      __kmp_lithe_fj_sp <= 0 && __kmp_lithe_region_depth <= 0)
+    return;
+
+  /* Nested per-region scheds are normally unwound by __kmp_lithe_parallel_leave;
+   * unwind defensively (innermost first) in case a region was abandoned. */
+  while (__kmp_lithe_fj_sp > 1) {
+    lithe_fork_join_sched_t *nested =
+        __kmp_lithe_fj_stack[__kmp_lithe_fj_sp - 1];
+    cur = lithe_sched_current();
+    if (nested && cur == (lithe_sched_t *)nested)
+      lithe_sched_exit();
+    __kmp_lithe_fj_stack[__kmp_lithe_fj_sp - 1] = NULL;
+    __kmp_lithe_fj_team[__kmp_lithe_fj_sp - 1] = NULL;
+    __kmp_lithe_fj_sp--;
+  }
+
+  top = __kmp_lithe_omp_top_fj;
+  if (top) {
+    cur = lithe_sched_current();
+    if (cur == (lithe_sched_t *)top) {
+      /* Move this context's parked OMP workers OFF the scheduler we are about
+       * to exit, onto the parent, before exiting it. Skipping this leaves them
+       * on a scheduler that has just been deregistered from its parent; the
+       * next hart to pick one up enters __uthread_yield with no current
+       * uthread and dies in __sigstack_free (observed: SIGSEGV at
+       * parlib vcore.c:149 with __sigstack=0xa8, i.e. NULL + offsetof).
+       * Same move __kmp_lithe_prepare_teardown_workers makes at process end,
+       * restricted to the team on this context. */
+      lithe_fork_join_sched_t *parent_fj = __kmp_lithe_opal_sched();
+      kmp_team_t *team = __kmp_lithe_fj_team[0];
+      if (parent_fj && team && parent_fj != top)
+        (void)__kmp_lithe_migrate_workers(team, parent_fj, top);
+      lithe_sched_exit();   /* drains this sched's harts, deregisters the child */
+    }
+  }
+
+  __kmp_lithe_omp_top_fj = NULL;
+  __kmp_lithe_top_sticky = 0;
+  if (__kmp_lithe_fj_sp > 0) {
+    __kmp_lithe_fj_stack[0] = NULL;
+    __kmp_lithe_fj_team[0] = NULL;
+  }
+  __kmp_lithe_fj_sp = 0;
+  __kmp_lithe_region_depth = 0;
+}
 
 /* Called from __kmp_internal_end before joining workers: move parked worker
  * contexts off the sticky OMP FJ onto the root parent, then sched_exit sticky
@@ -1794,11 +2019,58 @@ void __kmp_reap_worker(kmp_info_t *th) {
     struct kmp_lithe_join_ctl *jc =
         (struct kmp_lithe_join_ctl *)th->th.th_lithe_join_ctl;
     if (jc) {
-      lithe_mutex_lock(&jc->mx);
-      while (!jc->exited)
-        lithe_condvar_wait(&jc->cv, &jc->mx);
-      lithe_mutex_unlock(&jc->mx);
-      free(jc);
+      if (lithe_can_block()) {
+        lithe_mutex_lock(&jc->mx);
+        while (!jc->exited)
+          lithe_condvar_wait(&jc->cv, &jc->mx);
+        lithe_mutex_unlock(&jc->mx);
+        free(jc);
+      } else {
+        /* PROCESS TEARDOWN (2026-10-14). libomp's library destructor runs from
+         * _dl_fini, by which point the application has exited its own
+         * scheduler and main's context is back on the BASE scheduler, whose
+         * context_block is a deliberate fatal(). Blocking here printed
+         * "Contexts created by the base scheduler should never need to block!"
+         * and exited 1 on 20/20 runs.
+         *
+         * There is no scheduler left to park on, so spin on the worker's own
+         * exit flag with sched_yield() instead -- the worker is on a hart and
+         * will set it. Bounded, because nothing may hang a destructor.
+         *
+         * If the flag never arrives we LEAK jc on purpose: the worker may
+         * still write through it, and freeing memory a live worker can touch
+         * at exit is strictly worse than leaking it microseconds before the
+         * address space goes away.
+         *
+         * BOUND (2026-10-16): the bound used to be 1,000,000 sched_yield()s
+         * per worker. When the worker's scheduler is already destroyed (the
+         * ompctx reproducer: the app FJS owned the parked workers and
+         * fjs_destroy'd before _dl_fini) the flag can NEVER arrive, and the
+         * spin was the whole "2-3 s per trivial OMP cell" -- strace: 1.33 M
+         * sched_yield calls after "stage 10: clean return". A worker that is
+         * going to exit does so in microseconds; wait a few ms of wall time,
+         * then leak. LITHE_OMP_REAP_WAIT_MS overrides (default 20). */
+        static long reap_wait_ms = -1;
+        if (reap_wait_ms < 0) {
+          const char *e = getenv("LITHE_OMP_REAP_WAIT_MS");
+          reap_wait_ms = (e && *e) ? atol(e) : 20;
+        }
+        struct timespec t0, tn;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        int spins = 0;
+        while (!__atomic_load_n(&jc->exited, __ATOMIC_ACQUIRE)) {
+          sched_yield();
+          if ((++spins & 255) == 0) {
+            clock_gettime(CLOCK_MONOTONIC, &tn);
+            long ms = (tn.tv_sec - t0.tv_sec) * 1000L +
+                      (tn.tv_nsec - t0.tv_nsec) / 1000000L;
+            if (ms >= reap_wait_ms)
+              break;
+          }
+        }
+        if (__atomic_load_n(&jc->exited, __ATOMIC_ACQUIRE))
+          free(jc);
+      }
       th->th.th_lithe_join_ctl = NULL;
     }
     th->th.th_lithe_ctx = NULL;
@@ -2455,7 +2727,72 @@ void __kmp_resume_monitor() {
 void __kmp_yield(int cond) {
 #ifdef LIBOMP_USE_LITHE
   (void)cond;
-  lithe_context_yield();
+  /* PRE-SCHEDULER GUARD (2026-10-14). This is the single choke point for every
+   * KMP_YIELD in libomp -- locks, barriers, teardown -- and it was yielding the
+   * hart unconditionally. Not every thread that reaches it is a uthread:
+   *
+   *   parlib owns each Lithe context's TLS with a "backing pthread" that parks
+   *   in futex_wait and, per its own comment, "never enters the lithe
+   *   component". But that pthread inherits libomp's pthread_key destructor.
+   *   When a context exits and free_tls() releases its TLS, the backing pthread
+   *   exits, glibc runs __nptl_deallocate_tsd -> __kmp_internal_end_dest ->
+   *   __kmp_internal_end_thread -> __kmp_reset_root -> __kmp_free_team ->
+   *   __kmp_release_ticket_lock -> KMP_YIELD -> here, on a thread that has no
+   *   uthread at all. lithe_context_yield() then enters unsafe_uthread_yield
+   *   with current_uthread == NULL, which with parlib's asserts compiled out
+   *   (see src/parlib/src/internal/parlib.h) dereferences NULL and dies in
+   *   __sigstack_free with __sigstack = 0xa8. Measured: this is what made ONE
+   *   OpenMP region in ONE Lithe context unable to tear down.
+   *
+   * Note a `current_uthread != NULL` test is NOT enough here: the backing
+   * pthread runs destructors on the uthread's own TLS block, so
+   * current_uthread is non-NULL and merely STALE (state UT_NOT_RUNNING).
+   * parlib_can_cooperatively_yield() tests the real precondition. UCX's
+   * ucs_coop_yield() and libfabric's ofi_lithe_yield() carry the weaker NULL
+   * test, which covers their case (constructors) but should move to this
+   * predicate too. Falling back to sched_yield() is correct: a thread that is
+   * not a running uthread has no hart to donate, so the kernel scheduler is
+   * the only one that can help.
+   */
+  /* LITHE_OMP_YIELD_COND (2026-10-16, GAPS C11). Vanilla's __kmp_yield(cond)
+   * returns without a syscall when cond is false, and the hottest caller --
+   * __kmp_release_ticket_lock, run by the primary once in __kmp_fork_call and
+   * once in __kmp_join_call for EVERY parallel region -- passes
+   * `distance > avail_proc`, i.e. false unless the lock is massively
+   * contended. The (void)cond above turned that into an unconditional
+   * lithe_context_yield(): the primary gave up its hart twice per region,
+   * each time enqueue + eventfd write (fjs_maybe_reactor_wake, because the
+   * PMIx progress context keeps parlib_reactor_pending()==1) + hart re-enter +
+   * epoll_wait(0) + eventfd read + two context switches, and often came back
+   * on a different hart. strace on GROMACS trp-cage NP=1 OMP=4 (4 harts,
+   * demand-block off): 43k epoll_wait + 43k write + 48k read per 1000 steps,
+   * all from this path; vanilla: none.
+   *   0 = old behaviour, yield on every KMP_YIELD;
+   *   1 = honour cond exactly like vanilla (KMP_YIELD(0) is a pause only);
+   *   2 = honour cond, but still donate the hart when a runnable-but-hartless
+   *       peer exists on this sched (liveness when threads > harts). DEFAULT.
+   * A/B 2026-10-16 (login node, GROMACS trp-cage NP=1 OMP=4, 2000 steps, 3 reps
+   * each, vanilla -pin on 178-181 ns/day): mode 0 = 147.6-148.0 (0.82x);
+   * mode 1 = 180.8-181.1; mode 2 = 180.7-181.4 (1.00x). With mode 1/2 the
+   * C11 penalties also vanish: 4 harts + demand-block 180.8-181.1, 5 harts +
+   * demand-block 180.0-181.2 -- the "runnable-but-hartless peer" that
+   * demand-block kept handing harts to was the primary after this yield. */
+  static int yield_cond = -1;
+  if (__builtin_expect(yield_cond < 0, 0)) {
+    const char *e = getenv("LITHE_OMP_YIELD_COND");
+    yield_cond = e ? atoi(e) : 2;
+  }
+  if (!cond && yield_cond != 0) {
+    if (yield_cond == 1)
+      return;
+    if (!parlib_can_cooperatively_yield() ||
+        __kmp_lithe_hartless_peers() <= 0)
+      return;
+  }
+  if (parlib_can_cooperatively_yield())
+    lithe_context_yield();
+  else
+    sched_yield();   /* backing pthread in a TSD destructor, or vcore context */
 #else
   if (!cond)
     return;
@@ -3090,6 +3427,18 @@ int __kmp_invoke_microtask(microtask_t pkfn, int gtid, int tid, int argc,
                            void **exit_frame_ptr
 #endif
                            ) {
+#ifdef LIBOMP_USE_LITHE
+  /* Perfetto trace point (primary thread's share of a region comes through
+   * here; workers through lithe/kmp_lithe_entry.cpp). */
+  struct RunScope {
+    int gtid; bool on;
+    RunScope(int g, int t) : gtid(g), on(lithe_sched_trace_enabled() != 0) {
+      if (on) lithe_sched_trace_emit(LITHE_ST_OMP_RUN_BEGIN, NULL, (uint32_t)gtid, 0, (int32_t)t);
+    }
+    ~RunScope() { if (on) lithe_sched_trace_emit(LITHE_ST_OMP_RUN_END, NULL, (uint32_t)gtid, 0, 0); }
+  } _lt_run(gtid, tid);
+#endif
+
 #if OMPT_SUPPORT
   *exit_frame_ptr = OMPT_GET_FRAME_ADDRESS(0);
 #endif

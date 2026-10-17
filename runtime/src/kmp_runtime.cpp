@@ -12,6 +12,24 @@
 //===----------------------------------------------------------------------===//
 
 #include "kmp.h"
+
+#ifdef LIBOMP_USE_LITHE
+#include <lithe/sched_trace.h>
+/* Perfetto trace points (lithe-docker docs/PLAN-perfetto-lithe.md 2.4):
+ * scope guards so every return path closes its slice. No-ops unless
+ * LITHE_SCHED_TRACE=1. */
+struct KmpLitheTraceScope {
+  uint8_t end_ev; uint32_t ctx; bool on;
+  KmpLitheTraceScope(uint8_t begin_ev, uint8_t end_ev_, uint32_t ctx_, int32_t aux)
+      : end_ev(end_ev_), ctx(ctx_), on(lithe_sched_trace_enabled() != 0) {
+    if (on && begin_ev) lithe_sched_trace_emit(begin_ev, NULL, ctx, 0, aux);
+  }
+  ~KmpLitheTraceScope() { if (on && end_ev) lithe_sched_trace_emit(end_ev, NULL, ctx, 0, 0); }
+};
+#define KMP_LITHE_TRACE_SCOPE(var, b, e, ctx, aux) KmpLitheTraceScope var((b), (e), (uint32_t)(ctx), (int32_t)(aux))
+#else
+#define KMP_LITHE_TRACE_SCOPE(var, b, e, ctx, aux) do {} while (0)
+#endif
 #include "kmp_affinity.h"
 #include "kmp_atomic.h"
 #include "kmp_environment.h"
@@ -1423,6 +1441,7 @@ int __kmp_fork_call(ident_t *loc, int gtid,
                     va_list ap
 #endif
                     ) {
+  KMP_LITHE_TRACE_SCOPE(_lt_fork, LITHE_ST_OMP_FORK_BEGIN, 0, gtid, 0);
   void **argv;
   int i;
   int master_tid;
@@ -1581,7 +1600,7 @@ int __kmp_fork_call(ident_t *loc, int gtid,
         {
           KMP_TIME_PARTITIONED_BLOCK(OMP_parallel);
           KMP_SET_THREAD_STATE_BLOCK(IMPLICIT_TASK);
-          __kmp_invoke_microtask(microtask, gtid, 0, argc, parent_team->t.t_argv
+                  __kmp_invoke_microtask(microtask, gtid, 0, argc, parent_team->t.t_argv
 #if OMPT_SUPPORT
                                  ,
                                  exit_runtime_p
@@ -1794,7 +1813,7 @@ int __kmp_fork_call(ident_t *loc, int gtid,
           {
             KMP_TIME_PARTITIONED_BLOCK(OMP_parallel);
             KMP_SET_THREAD_STATE_BLOCK(IMPLICIT_TASK);
-            __kmp_invoke_microtask(microtask, gtid, 0, argc,
+                      __kmp_invoke_microtask(microtask, gtid, 0, argc,
                                    parent_team->t.t_argv
 #if OMPT_SUPPORT
                                    ,
@@ -1899,7 +1918,7 @@ int __kmp_fork_call(ident_t *loc, int gtid,
           {
             KMP_TIME_PARTITIONED_BLOCK(OMP_parallel);
             KMP_SET_THREAD_STATE_BLOCK(IMPLICIT_TASK);
-            __kmp_invoke_microtask(microtask, gtid, 0, argc, args
+                      __kmp_invoke_microtask(microtask, gtid, 0, argc, args
 #if OMPT_SUPPORT
                                    ,
                                    exit_runtime_p
@@ -2277,8 +2296,11 @@ int __kmp_fork_call(ident_t *loc, int gtid,
   {
     KMP_TIME_PARTITIONED_BLOCK(OMP_parallel);
     KMP_SET_THREAD_STATE_BLOCK(IMPLICIT_TASK);
-    if (!team->t.t_invoke(gtid)) {
-      KMP_ASSERT2(0, "cannot invoke microtask for MASTER thread");
+    {
+      KMP_LITHE_TRACE_SCOPE(_lt_prun, LITHE_ST_OMP_RUN_BEGIN, LITHE_ST_OMP_RUN_END, gtid, 0);
+      if (!team->t.t_invoke(gtid)) {
+        KMP_ASSERT2(0, "cannot invoke microtask for MASTER thread");
+      }
     }
   }
   KA_TRACE(20, ("__kmp_fork_call: T#%d(%d:0) done microtask = %p\n", gtid,
@@ -2330,6 +2352,7 @@ void __kmp_join_call(ident_t *loc, int gtid
                      int exit_teams
 #endif /* OMP_40_ENABLED */
                      ) {
+  KMP_LITHE_TRACE_SCOPE(_lt_join, 0, LITHE_ST_OMP_FORK_END, gtid, 0);
   KMP_TIME_DEVELOPER_PARTITIONED_BLOCK(KMP_join_call);
   kmp_team_t *team;
   kmp_team_t *parent_team;

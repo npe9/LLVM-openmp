@@ -33,6 +33,7 @@
 //     cooperative block (safety valve). 0 = unbounded (structural design point).
 extern "C" {
 extern int __kmp_lithe_inner_spin;
+extern int __kmp_lithe_fork_yield;
 extern kmp_uint64 __kmp_lithe_inner_spin_max;
 extern kmp_int64 __kmp_lithe_fork_spin_max;
 // Hot-team fork/join hot-spin (default path). See z_Linux_util.cpp.
@@ -48,6 +49,14 @@ void __kmp_lithe_inner_spin_config(void);
 // Returns 1 if it yielded (caller resumed), 0 if it kept spinning. See
 // z_Linux_util.cpp __kmp_lithe_inner_barrier_yield.
 int __kmp_lithe_inner_barrier_yield(kmp_info_t *th);
+// Demand block at the fork/join barrier (LITHE_OMP_DEMAND_BLOCK, default on
+// under LITHE_OMP_FLAT=1): spin hot while nobody on this sched is runnable-but-
+// hartless, otherwise block NOW instead of polling out KMP_BLOCKTIME. See
+// z_Linux_util.cpp __kmp_lithe_demand_block.
+int __kmp_lithe_demand_block_on(void);
+long lithe_fork_join_current_runnable_count(void);
+long __kmp_lithe_hartless_peers(void); /* z_Linux_util.cpp, LITHE_OMP_IDLE_AWARE */
+int __kmp_lithe_flat_on(void); /* z_Linux_util.cpp, LITHE_OMP_FLAT */
 }
 #endif
 
@@ -206,6 +215,25 @@ __kmp_wait_template(kmp_info_t *this_thr, C *flag,
   // once here (cheap) and consulted in the spin loop's fork/join branch.
   int lithe_fork_hot = 0;
   int lithe_did_block = 0;
+  int lithe_force_block = 0; // demand block: skip the blocktime poll this pass
+  const int lithe_demand = __kmp_lithe_demand_block_on();
+  // FLAT MODE + KMP_BLOCKTIME=infinite is a hang (2026-10-16, docs/GAPS.md B15):
+  // workers hot-spin on every hart forever while their masters sit RUNNABLE,
+  // and demand block cannot help because the "infinite" early-continue below
+  // runs before the suspend, while forcing the suspend anyway loses wakeups
+  // (releasers skip resume under an infinite blocktime). On a 3-hart login node
+  // RPH4xOMP2 hung 3/3 at "Creating OpenMP Thread Pool"; 200 ms is 8/8 clean.
+  // So in flat mode an infinite blocktime is clamped to the libomp default,
+  // once, before the first wait, and said once on stderr. LITHE_OMP_FLAT=0
+  // (nested schedulers) keeps the user's value.
+  if (__kmp_lithe_flat_on() && __kmp_dflt_blocktime == KMP_MAX_BLOCKTIME) {
+    static int said = 0;
+    __kmp_dflt_blocktime = KMP_DEFAULT_BLOCKTIME;
+    if (!__atomic_exchange_n(&said, 1, __ATOMIC_ACQ_REL))
+      fprintf(stderr, "[libomp lithe] LITHE_OMP_FLAT=1 with KMP_BLOCKTIME=infinite "
+                      "would hang under hart scarcity; clamped to %d ms\n",
+              KMP_DEFAULT_BLOCKTIME);
+  }
   kmp_uint64 lithe_fork_budget = 0;
   if (!this_thr->th.th_lithe_barrier_inner) {
     kmp_team_t *lt = this_thr->th.th_team;
@@ -444,8 +472,26 @@ final_spin=FALSE)
         (void)__kmp_lithe_inner_barrier_yield(this_thr);
         continue;
       }
+    } else if (lithe_demand && __kmp_lithe_hartless_peers() > 0) {
+      // FORK/JOIN barrier, DEMAND BLOCK (LITHE_OMP_DEMAND_BLOCK): a peer on
+      // this sched is RUNNABLE but has no hart -- in the hosted flat model
+      // usually our own master, i.e. the logical MPI rank that has to reach
+      // the next fork. Hand the hart over by BLOCKING now (one cooperative
+      // park; we are not runnable again until the next release), not by
+      // yielding (LITHE_OMP_FORK_YIELD: re-dispatched, flag still clear,
+      // yield again -- the measured 40x storm) and not after KMP_BLOCKTIME of
+      // spinning over the master's head (the measured "slow, not hung").
+      // Falls through to flag->suspend() below with the time poll bypassed.
+      lithe_force_block = 1;
+      lithe_did_block = 1; // hot-team AIMD: this gap counts as "long"
     } else {
       // FORK/JOIN (region-boundary) barrier.
+      lithe_force_block = 0;
+      // 0) Liveness: donate the hart to a RUNNABLE-but-hartless peer on this
+      //    sched (typically our own master). LITHE_OMP_FORK_YIELD, see
+      //    z_Linux_util.cpp. One atomic load when nobody is waiting.
+      if (__kmp_lithe_fork_yield && __kmp_lithe_inner_barrier_yield(this_thr))
+        continue;
       // 1) Manual override (LITHE_OMP_FORK_SPIN_MAX != 0) takes precedence for
       //    A/B experiments.
       if (__kmp_lithe_fork_spin_max != 0) {
@@ -506,6 +552,11 @@ final_spin=FALSE)
 #endif
 
     // Don't suspend if KMP_BLOCKTIME is set to "infinite"
+    // (Under Lithe flat mode this can no longer be MAX: see the clamp at the top
+    // of this function. Forcing a suspend here under an infinite blocktime was
+    // tried on 2026-10-16 and produced a lost wakeup -- releasers skip the
+    // resume path when blocktime is infinite because nobody is expected to
+    // sleep -- so the setting itself is what has to go.)
     if (__kmp_dflt_blocktime == KMP_MAX_BLOCKTIME)
       continue;
 
@@ -518,8 +569,13 @@ final_spin=FALSE)
     if (TCR_4(__kmp_global.g.g_time.dt.t_value) < hibernate)
       continue;
 #else
+#ifdef LIBOMP_USE_LITHE
+    if (!lithe_force_block && KMP_BLOCKING(hibernate_goal, poll_count++))
+      continue;
+#else
     if (KMP_BLOCKING(hibernate_goal, poll_count++))
       continue;
+#endif
 #endif
 
     KF_TRACE(50, ("__kmp_wait_sleep: T#%d suspend time reached\n", th_gtid));
