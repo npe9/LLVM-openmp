@@ -480,8 +480,12 @@ static void __kmp_lithe_rebind_ctx(lithe_fork_join_context_t *ctx,
 static int __kmp_lithe_flat = -1;
 extern "C" int __kmp_lithe_flat_on(void) {
   if (__kmp_lithe_flat < 0) {
+    /* Default ON since 2026-10-19 (GAPS B24): every validated configuration (HPDC
+     * suite, integration_check, placement pairs, hosted _omp arm) already set
+     * LITHE_OMP_FLAT=1, and the per-region-scheduler mode it replaces livelocks on
+     * nested parallelism. LITHE_OMP_FLAT=0 restores the old mode. */
     const char *e = getenv("LITHE_OMP_FLAT");
-    __kmp_lithe_flat = (e && e[0] == '1') ? 1 : 0;
+    __kmp_lithe_flat = (e && e[0] == '0') ? 0 : 1;
   }
   return __kmp_lithe_flat;
 }
@@ -541,6 +545,24 @@ static int __kmp_lithe_migrate_workers(kmp_team_t *team,
   return runnable_migrated;
 }
 
+/* Nested parallel regions (team level > 1) run in the CALLER's fork-join
+ * scheduler, as every region does in flat mode (2026-10-19, GAPS B24). Before,
+ * each outer-team worker took the depth-0 path for its first inner region and
+ * created + entered its own sticky child scheduler: 4 outer threads made 4 child
+ * schedulers competing for 4 harts, and a context runnable in one that held no
+ * harts was invisible to the idle harts of another. bench/alt/omp_nested.c 4x4
+ * livelocked (inner masters spinning on __kmp_forkjoin_lock behind a holder
+ * parked in a hart-less child; 3 harts idle in hart_enter). 1x4 crashed at
+ * teardown. LITHE_OMP_NESTED_SCHED=1 restores the per-region schedulers. */
+static int __kmp_lithe_nested_sched = -1;
+static int __kmp_lithe_nested_sched_on(void) {
+  if (__kmp_lithe_nested_sched < 0) {
+    const char *e = getenv("LITHE_OMP_NESTED_SCHED");
+    __kmp_lithe_nested_sched = (e && e[0] == '1') ? 1 : 0;
+  }
+  return __kmp_lithe_nested_sched;
+}
+
 extern "C" void __kmp_lithe_parallel_sched_begin(kmp_team_t *team) {
   lithe_fork_join_sched_t *fj;
   lithe_fork_join_sched_t *opal;
@@ -552,6 +574,16 @@ extern "C" void __kmp_lithe_parallel_sched_begin(kmp_team_t *team) {
   opal = __kmp_lithe_opal_sched();
   if (!opal)
     return;
+
+  if (team->t.t_level > 1 && !__kmp_lithe_nested_sched_on()) {
+    lithe_fork_join_sched_t *f = __kmp_lithe_flat_sched();
+    if (f) {
+      int runnable_migrated = __kmp_lithe_migrate_workers(team, f, NULL);
+      if (runnable_migrated > 0)
+        lithe_hart_request(runnable_migrated);
+    }
+    return;
+  }
 
   if (__kmp_lithe_flat_on()) {
     lithe_fork_join_sched_t *f = __kmp_lithe_flat_sched();
@@ -629,6 +661,8 @@ extern "C" void __kmp_lithe_parallel_leave(kmp_team_t *team) {
 
   if (!team || team->t.t_nproc <= 1)
     return;
+  if (team->t.t_level > 1 && !__kmp_lithe_nested_sched_on())
+    return; /* nested region ran in the caller's scheduler: nothing to unwind */
   if (__kmp_lithe_flat_on() && __kmp_lithe_region_depth <= 0)
     return; /* flat: no per-region scheduler to unwind */
   if (__kmp_lithe_region_depth <= 0)
