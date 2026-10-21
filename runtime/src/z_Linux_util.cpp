@@ -489,6 +489,17 @@ extern "C" int __kmp_lithe_flat_on(void) {
   }
   return __kmp_lithe_flat;
 }
+/* LITHE_OMP_SERIAL_DISP_CACHE (2026-10-21, default 0 for A/B): keep the outermost
+ * serialized region's dispatch buffer instead of free + malloc per one-thread
+ * region; see __kmpc_end_serialized_parallel (kmp_csupport.cpp). */
+static int __kmp_lithe_serial_disp_cache = -1;
+extern "C" int __kmp_lithe_serial_disp_cache_on(void) {
+  if (__kmp_lithe_serial_disp_cache < 0) {
+    const char *e = getenv("LITHE_OMP_SERIAL_DISP_CACHE");
+    __kmp_lithe_serial_disp_cache = (e && e[0] == '1') ? 1 : 0;
+  }
+  return __kmp_lithe_serial_disp_cache;
+}
 /* Demand block (see __kmp_lithe_demand_block above): explicit env wins, else
  * on exactly when flat mode is. Resolved once; the result is cached. */
 extern "C" int __kmp_lithe_demand_block_on(void) {

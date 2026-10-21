@@ -443,6 +443,9 @@ void __kmpc_serialized_parallel(ident_t *loc, kmp_int32 global_tid) {
 
 Leave a serialized parallel construct.
 */
+#ifdef LIBOMP_USE_LITHE
+extern "C" int __kmp_lithe_serial_disp_cache_on(void); /* z_Linux_util.cpp */
+#endif
 void __kmpc_end_serialized_parallel(ident_t *loc, kmp_int32 global_tid) {
   kmp_internal_control_t *top;
   kmp_info_t *this_thr;
@@ -520,9 +523,26 @@ void __kmpc_end_serialized_parallel(ident_t *loc, kmp_int32 global_tid) {
   {
     dispatch_private_info_t *disp_buffer =
         serial_team->t.t_dispatch->th_disp_buffer;
-    serial_team->t.t_dispatch->th_disp_buffer =
-        serial_team->t.t_dispatch->th_disp_buffer->next;
-    __kmp_free(disp_buffer);
+#ifdef LIBOMP_USE_LITHE
+    /* Keep the outermost serialized level's buffer for the next region instead of
+     * a free + __kmp_allocate per one-thread region (__kmp_serialized_parallel
+     * reuses a non-NULL th_disp_buffer). Hosted ranks share one glibc heap, and
+     * that malloc waited on the arena lock in the kernel, blocking the whole hart
+     * (perf 2026-10-21: 2/3 of hosted arena-lock waits in CG; GAPS C17).
+     * __kmp_free_team frees the cached buffer. LITHE_OMP_SERIAL_DISP_CACHE=1
+     * (default 0). Only matters under GLIBC_TUNABLES=glibc.malloc.tcache_count=0
+     * MALLOC_ARENA_MAX=1 (WAXPY 1.33 -> 0.65 ms); with glibc defaults the tcache
+     * already serves this malloc and the knob measured nothing (0.56-0.69 either
+     * way), so the login env dropped those tunables instead. */
+    if (__kmp_lithe_serial_disp_cache_on() && serial_team->t.t_serialized == 1 &&
+        disp_buffer->next == NULL) {
+      memset(disp_buffer, 0, sizeof(*disp_buffer));
+    } else
+#endif
+    {
+      serial_team->t.t_dispatch->th_disp_buffer = disp_buffer->next;
+      __kmp_free(disp_buffer);
+    }
   }
 
   --serial_team->t.t_serialized;
