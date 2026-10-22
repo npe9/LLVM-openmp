@@ -377,6 +377,13 @@ struct kmp_lithe_join_ctl {
   lithe_mutex_t mx;
   lithe_condvar_t cv;
   volatile int exited;
+  /* Set by the worker AFTER its final unlock of `mx`: its last access to the ctl. A reaper that
+   * cannot block (a foreign thread -- e.g. a Python/joblib thread whose root is being torn down --
+   * or process teardown) spins, and must wait for THIS, not `exited`: `exited` is stored while the
+   * worker still holds `mx`, so freeing on `exited` let the worker's lithe_mutex_unlock write
+   * freed memory (SIGSEGV at mutex.c:200 under __kmp_lithe_launch_worker, ~1-2 % of
+   * .build_logs/ys_crash/omp_foreign_waves runs; docs/GAPS.md B41). */
+  volatile int released;
 };
 
 /* OpenMP parallel regions use a dedicated fork-join scheduler nested under
@@ -1461,6 +1468,7 @@ static void __kmp_lithe_launch_worker(void *thr) {
     jc->exited = 1;
     lithe_condvar_signal(&jc->cv);
     lithe_mutex_unlock(&jc->mx);
+    __atomic_store_n(&jc->released, 1, __ATOMIC_RELEASE);
   }
   lithe_context_exit();
 }
@@ -1730,6 +1738,7 @@ void __kmp_create_worker(int gtid, kmp_info_t *th, size_t stack_size) {
       lithe_mutex_init(&jc->mx, NULL);
       lithe_condvar_init(&jc->cv);
       jc->exited = 0;
+      jc->released = 0;
       th->th.th_lithe_join_ctl = jc;
     }
 
@@ -2103,7 +2112,7 @@ void __kmp_reap_worker(kmp_info_t *th) {
         struct timespec t0, tn;
         clock_gettime(CLOCK_MONOTONIC, &t0);
         int spins = 0;
-        while (!__atomic_load_n(&jc->exited, __ATOMIC_ACQUIRE)) {
+        while (!__atomic_load_n(&jc->released, __ATOMIC_ACQUIRE)) {
           sched_yield();
           if ((++spins & 255) == 0) {
             clock_gettime(CLOCK_MONOTONIC, &tn);
@@ -2113,7 +2122,7 @@ void __kmp_reap_worker(kmp_info_t *th) {
               break;
           }
         }
-        if (__atomic_load_n(&jc->exited, __ATOMIC_ACQUIRE))
+        if (__atomic_load_n(&jc->released, __ATOMIC_ACQUIRE))
           free(jc);
       }
       th->th.th_lithe_join_ctl = NULL;
