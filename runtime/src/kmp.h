@@ -1096,6 +1096,9 @@ static void __kmp_x86_pause(void) { _mm_pause(); }
 #define KMP_INIT_YIELD(count)                                                  \
   { (count) = __kmp_yield_init; }
 
+#ifdef LIBOMP_USE_LITHE
+extern void __kmp_yield_release(int cond);
+#endif
 #define KMP_YIELD(cond)                                                        \
   {                                                                            \
     KMP_CPU_PAUSE();                                                           \

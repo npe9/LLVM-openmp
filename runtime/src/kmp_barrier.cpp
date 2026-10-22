@@ -55,6 +55,7 @@ extern "C" void lithe_fork_join_wake_batch_begin(void);
 extern "C" void lithe_fork_join_wake_batch_end(void);
 #define LITHE_WAKE_BATCH_BEGIN() lithe_fork_join_wake_batch_begin()
 #define LITHE_WAKE_BATCH_END() lithe_fork_join_wake_batch_end()
+extern "C" int __kmp_lithe_fj_linear_gather(int nproc);
 #else
 #define LITHE_WAKE_BATCH_BEGIN() ((void)0)
 #define LITHE_WAKE_BATCH_END() ((void)0)
@@ -1732,7 +1733,12 @@ void __kmp_join_barrier(int gtid) {
     __kmp_itt_barrier_starting(gtid, itt_sync_obj);
 #endif /* USE_ITT_BUILD */
 
-  switch (__kmp_barrier_gather_pattern[bs_forkjoin_barrier]) {
+  kmp_bar_pat_e fj_gather = __kmp_barrier_gather_pattern[bs_forkjoin_barrier];
+#ifdef LIBOMP_USE_LITHE
+  if (__kmp_lithe_fj_linear_gather((int)nproc))
+    fj_gather = bp_linear_bar; /* oversubscribed: see z_Linux_util.cpp */
+#endif
+  switch (fj_gather) {
   case bp_hyper_bar: {
     KMP_ASSERT(__kmp_barrier_gather_branch_bits[bs_forkjoin_barrier]);
     __kmp_hyper_barrier_gather(bs_forkjoin_barrier, this_thr, gtid, tid,

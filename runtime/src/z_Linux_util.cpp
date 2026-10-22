@@ -176,6 +176,23 @@ kmp_uint64 __kmp_lithe_hot_budget_max = 4000000;
  * known to regress/stall at higher thread counts -- do not enable for
  * production runs. Default path is the proven per-worker lithe condvar. */
 int __kmp_lithe_warm_vcores = 0;         /* LITHE_OMP_WARM_VCORES (default OFF) */
+/* FAST PARK (LITHE_OMP_FAST_PARK, 2026-10-22, GAPS C21). Oversubscribed teams
+ * (OMP threads > harts) block at every fork/join barrier (demand block), so
+ * each region pays one suspend + one resume per worker. Through the per-thread
+ * lithe mutex + condvar that was ~0.4 us per wake on the master's serial
+ * release path (mutex lock, condvar MCS lock, unblock, mutex unlock, plus the
+ * woken worker re-taking the mutex): 8 threads on 4 harts ran a tiny region in
+ * 5-7 us vs BOLT 2.2 us. Fast park replaces both with one state word: the
+ * worker publishes PARKING, re-checks the sleep bit, and blocks; the block
+ * callback CASes PARKING->PARKED (or unblocks itself if a wake already landed);
+ * the waker CASes PARKED->RUNNING and unblocks, or PARKING/RUNNING->WAKE (a
+ * token the waiter consumes instead of blocking). The waiter clears its own
+ * sleep bit on the way out, so a NULL-flag resume (__kmp_null_resume_wrapper:
+ * task wakeups, teardown) never dereferences th_sleep_loc, which may point at
+ * a returned waiter's stack wrapper -- the mutex used to cover that. A stale
+ * WAKE costs one early return from suspend; the caller re-checks its flag.
+ * No lock on either side. */
+int __kmp_lithe_fast_park = 1;           /* LITHE_OMP_FAST_PARK (default ON, =0 restores the mutex+condvar) */
 extern "C" void lithe_fork_join_park_warm(void *mx);
 extern "C" void lithe_fork_join_resume_warm(lithe_context_t *ctx);
 static int __kmp_lithe_inner_spin_inited = 0;
@@ -208,6 +225,9 @@ extern "C" void __kmp_lithe_inner_spin_config(void) {
   e = getenv("LITHE_OMP_WARM_VCORES");
   if (e && *e)
     __kmp_lithe_warm_vcores = atoi(e);
+  e = getenv("LITHE_OMP_FAST_PARK");
+  if (e && *e)
+    __kmp_lithe_fast_park = atoi(e);
   e = getenv("LITHE_OMP_INNER_YIELD");
   if (e && *e)
     __kmp_lithe_inner_yield = atoi(e);
@@ -259,6 +279,29 @@ extern "C" int __kmp_lithe_fork_hot_ok(int nproc) {
   if (nproc < 1)
     nproc = 1;
   return max_vcores() >= nproc + reserve;
+}
+
+/* OVERSUBSCRIBED LINEAR GATHER (LITHE_OMP_OVERSUB_LINEAR_GATHER, 2026-10-22,
+ * GAPS C21). With more team threads than harts, every join-barrier waiter
+ * demand-blocks. The default hyper gather makes intermediate parents (tid 4
+ * for 5..7) wait on their children too, so each tree level adds a
+ * block -> unblock -> dispatch round on the critical path (trace: fork->last
+ * worker start 5 us at 8 threads on 4 harts vs 0.5 us at 4). A linear gather
+ * leaves only the master waiting. With LITHE_OMP_FAST_PARK: LULESH 16 threads
+ * on 4 harts 2150-2270 -> 2540-2570 zones/s, 8 threads within noise, not
+ * applied at 1:1. Default ON; =0 restores the configured pattern. Same answer on every thread of a team (team size and the
+ * fixed max_vcores()), so the pattern never differs within one barrier. An
+ * explicit KMP_FORKJOIN_BARRIER_PATTERN wins. */
+extern "C" int __kmp_lithe_fj_linear_gather(int nproc) {
+  static int mode = -1;
+  if (__builtin_expect(mode < 0, 0)) {
+    const char *e = getenv("LITHE_OMP_OVERSUB_LINEAR_GATHER"); /* default ON */
+    int m = (e && *e) ? atoi(e) : 1;
+    if (getenv("KMP_FORKJOIN_BARRIER_PATTERN"))
+      m = 0;
+    mode = m;
+  }
+  return mode && __kmp_lithe_flat_on() && nproc > (int)max_vcores();
 }
 
 /* Inner-barrier liveness: a worker that hot-spins on the team-local
@@ -337,7 +380,46 @@ extern "C" int __kmp_lithe_inner_barrier_yield(kmp_info_t *th) {
 struct kmp_lithe_suspend_ctl {
   lithe_mutex_t mx;
   lithe_condvar_t cv;
+  volatile int park;           /* fast park state, KMP_LITHE_PARK_* */
+  lithe_context_t *park_ctx;   /* the parked context, valid in PARKED */
 };
+enum { KMP_LITHE_PARK_RUNNING = 0, KMP_LITHE_PARK_PARKING = 1,
+       KMP_LITHE_PARK_PARKED = 2, KMP_LITHE_PARK_WAKE = 3 };
+
+/* Block callback (hart context, the waiter is already off its stack). */
+static void __kmp_lithe_fast_park_cb(lithe_context_t *ctx, void *arg) {
+  struct kmp_lithe_suspend_ctl *ctl = (struct kmp_lithe_suspend_ctl *)arg;
+  ctl->park_ctx = ctx;
+  int exp = KMP_LITHE_PARK_PARKING;
+  if (!__atomic_compare_exchange_n(&ctl->park, &exp, KMP_LITHE_PARK_PARKED,
+                                   false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+    /* a wake landed between the sleep-bit re-check and the block */
+    __atomic_store_n(&ctl->park, KMP_LITHE_PARK_RUNNING, __ATOMIC_RELEASE);
+    lithe_context_unblock(ctx);
+  }
+}
+
+/* Waker side (after clearing the sleep bit when it has the flag). */
+static void __kmp_lithe_fast_unpark(struct kmp_lithe_suspend_ctl *ctl) {
+  int s = __atomic_load_n(&ctl->park, __ATOMIC_SEQ_CST);
+  for (;;) {
+    if (s == KMP_LITHE_PARK_PARKED) {
+      if (__atomic_compare_exchange_n(&ctl->park, &s, KMP_LITHE_PARK_RUNNING,
+                                      false, __ATOMIC_ACQ_REL,
+                                      __ATOMIC_ACQUIRE)) {
+        lithe_context_unblock(ctl->park_ctx);
+        return;
+      }
+    } else if (s == KMP_LITHE_PARK_WAKE) {
+      return; /* already woken */
+    } else { /* PARKING or RUNNING: leave a token */
+      if (__atomic_compare_exchange_n(&ctl->park, &s, KMP_LITHE_PARK_WAKE,
+                                      false, __ATOMIC_ACQ_REL,
+                                      __ATOMIC_ACQUIRE))
+        return;
+    }
+  }
+}
 
 static struct kmp_lithe_suspend_ctl *
 __kmp_lithe_suspend_ctl(kmp_info_t *th) {
@@ -353,6 +435,8 @@ __kmp_lithe_suspend_ctl(kmp_info_t *th) {
   }
   lithe_mutex_init(&p->mx, NULL);
   lithe_condvar_init(&p->cv);
+  p->park = KMP_LITHE_PARK_RUNNING;
+  p->park_ctx = NULL;
   void *expected = NULL;
   if (!__atomic_compare_exchange_n(slot, &expected, (void *)p, false,
                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
@@ -2473,6 +2557,27 @@ static inline void __kmp_suspend_template(int th_gtid, C *flag) {
   {
     __kmp_lithe_inner_spin_config();
     struct kmp_lithe_suspend_ctl *ctl = __kmp_lithe_suspend_ctl(th);
+    if (__kmp_lithe_fast_park) {
+      old_spin = flag->set_sleeping();
+      if (flag->done_check_val(old_spin)) {
+        flag->unset_sleeping();
+        return;
+      }
+      TCW_PTR(th->th.th_sleep_loc, (void *)flag);
+      int exp = KMP_LITHE_PARK_RUNNING;
+      if (__atomic_compare_exchange_n(&ctl->park, &exp, KMP_LITHE_PARK_PARKING,
+                                      false, __ATOMIC_SEQ_CST,
+                                      __ATOMIC_SEQ_CST) &&
+          flag->is_sleeping())
+        lithe_context_block(__kmp_lithe_fast_park_cb, ctl);
+      /* woken, token consumed, or released before parking */
+      __atomic_store_n(&ctl->park, KMP_LITHE_PARK_RUNNING, __ATOMIC_SEQ_CST);
+      flag->unset_sleeping();
+      TCW_PTR(th->th.th_sleep_loc, NULL);
+      KF_TRACE(30, ("__kmp_suspend_template: T#%d exit (lithe fast park)\n",
+                    th_gtid));
+      return;
+    }
     lithe_mutex_lock(&ctl->mx);
     old_spin = flag->set_sleeping();
     if (flag->done_check_val(old_spin)) {
@@ -2657,6 +2762,12 @@ static inline void __kmp_resume_template(int target_gtid, C *flag) {
   {
     __kmp_lithe_inner_spin_config();
     struct kmp_lithe_suspend_ctl *ctl = __kmp_lithe_suspend_ctl(th);
+    if (__kmp_lithe_fast_park) {
+      if (flag)
+        flag->unset_sleeping();
+      __kmp_lithe_fast_unpark(ctl);
+      return;
+    }
     lithe_mutex_lock(&ctl->mx);
     if (!flag) {
       flag = (C *)CCAST(void *, th->th.th_sleep_loc);
@@ -2860,6 +2971,29 @@ void __kmp_yield(int cond) {
   sched_yield();
 #endif /* LIBOMP_USE_LITHE */
 }
+
+#ifdef LIBOMP_USE_LITHE
+/* B43 (2026-10-22). __kmp_release_ticket_lock ends in KMP_YIELD(distance >
+ * avail_proc), false unless the lock is massively contended, and
+ * LITHE_OMP_YIELD_COND=2 turns a false cond into a hart donation whenever a
+ * runnable peer is hartless -- which in an oversubscribed team is always. Task
+ * deques are ticket-lock protected, so the producer gave its hart away after
+ * every task push and the executors after every pop: OMP tasking with 8
+ * threads on 4 harts (1000 regions x 64 tasks) ran 0.9 s to >90 s, bimodal,
+ * vs 0.1 s for BOLT, stock libomp and Lithe at 1:1. A releaser waits for
+ * nobody, so mode 2's liveness argument (spin loops waiting on a hartless
+ * peer) does not apply here; honour cond like vanilla. LITHE_OMP_RELEASE_DONATE
+ * =1 restores the donation. */
+void __kmp_yield_release(int cond) {
+  static int donate = -1;
+  if (__builtin_expect(donate < 0, 0)) {
+    const char *e = getenv("LITHE_OMP_RELEASE_DONATE");
+    donate = (e && *e) ? atoi(e) : 0;
+  }
+  if (cond || donate)
+    __kmp_yield(cond);
+}
+#endif
 
 void __kmp_gtid_set_specific(int gtid) {
   if (__kmp_init_gtid) {

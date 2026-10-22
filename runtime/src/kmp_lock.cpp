@@ -752,8 +752,14 @@ int __kmp_release_ticket_lock(kmp_ticket_lock_t *lck, kmp_int32 gtid) {
   std::atomic_fetch_add_explicit(&lck->lk.now_serving, 1U,
                                  std::memory_order_release);
 
+#ifdef LIBOMP_USE_LITHE
+  /* B43: no hart donation from a plain release (see __kmp_yield_release). */
+  __kmp_yield_release(distance >
+            (kmp_uint32)(__kmp_avail_proc ? __kmp_avail_proc : __kmp_xproc));
+#else
   KMP_YIELD(distance >
             (kmp_uint32)(__kmp_avail_proc ? __kmp_avail_proc : __kmp_xproc));
+#endif
   return KMP_LOCK_RELEASED;
 }
 
