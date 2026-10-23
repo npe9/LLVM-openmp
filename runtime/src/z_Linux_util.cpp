@@ -266,6 +266,14 @@ static int __kmp_lithe_is_pure_omp(void) {
  * host (pure OpenMP), treat hot-team as ON with reserve 0 (no progress hart
  * needed). Explicit LITHE_OMP_HOT_TEAM=0/1 always wins. Hybrid stays default
  * OFF so miniFE is unchanged. */
+/* Policy hart budget. With PARLIB_SPARE_VCORES, max_vcores() is the vcore CAPACITY
+ * (VCORE_LIMIT + compensation spares, docs/GAPS.md B42); "how many harts may this
+ * team have" is parlib_vcore_limit(). Weak so an older libparlib still links. */
+extern "C" int parlib_vcore_limit(void) __attribute__((weak));
+static int __kmp_lithe_hart_limit(void) {
+  return &parlib_vcore_limit ? parlib_vcore_limit() : (int)max_vcores();
+}
+
 extern "C" int __kmp_lithe_fork_hot_ok(int nproc) {
   int hot = __kmp_lithe_hot_team;
   int reserve = __kmp_lithe_hot_reserve;
@@ -278,7 +286,7 @@ extern "C" int __kmp_lithe_fork_hot_ok(int nproc) {
     return 0;
   if (nproc < 1)
     nproc = 1;
-  return max_vcores() >= nproc + reserve;
+  return __kmp_lithe_hart_limit() >= nproc + reserve;
 }
 
 /* OVERSUBSCRIBED LINEAR GATHER (LITHE_OMP_OVERSUB_LINEAR_GATHER, 2026-10-22,
@@ -301,7 +309,7 @@ extern "C" int __kmp_lithe_fj_linear_gather(int nproc) {
       m = 0;
     mode = m;
   }
-  return mode && __kmp_lithe_flat_on() && nproc > (int)max_vcores();
+  return mode && __kmp_lithe_flat_on() && nproc > __kmp_lithe_hart_limit();
 }
 
 /* Inner-barrier liveness: a worker that hot-spins on the team-local
@@ -2556,6 +2564,14 @@ static inline void __kmp_suspend_template(int th_gtid, C *flag) {
    * the hart and forced an epoll netpoll on every yield. */
   {
     __kmp_lithe_inner_spin_config();
+    /* B45 (2026-10-22): a foreign team master (a plain pthread, e.g. a joblib
+     * thread that opened the region) is not a Lithe context and cannot block one:
+     * lithe_context_block -> uthread_yield with current_uthread == NULL segfaulted
+     * (omp_foreign_waves, VCORE_LIMIT=1 + PARLIB_SPARE_VCORES=1, 5/100, when the
+     * join gather made that master wait). It holds no hart, so return and let the
+     * wait loop spin. */
+    if (!lithe_can_block())
+      return;
     struct kmp_lithe_suspend_ctl *ctl = __kmp_lithe_suspend_ctl(th);
     if (__kmp_lithe_fast_park) {
       old_spin = flag->set_sleeping();
