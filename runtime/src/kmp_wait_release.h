@@ -438,6 +438,14 @@ final_spin=FALSE)
     // the fork-join scheduler on every iteration, which re-enters hart_enter ->
     // fjs_reactor_poll -> epoll_wait(0): an epoll storm and anti-scaling.
     KMP_CPU_PAUSE();
+    // NEGATIVE RESULT (2026-10-22, lithified PyTorch dataloader_train 2 vs 20
+    // images/s): neither a sched_yield every N spins (to share the CPU with
+    // DataLoader worker PROCESSES; 8-11) nor polling parlib's reactor from this
+    // spin (so a pipe-waiting context wakes without a free hart; no change)
+    // fixed it. The cause was hart budget, not this loop: fork()ed workers
+    // inherited the trainer's 4 harts and their idle harts spun on a pending
+    // reactor waiter (PARLIB_FORK_CHILD_VCORES, LITHE_FJS_IDLE_PENDING_NEEDS_SLOT;
+    // docs/GAPS.md B47). Do not add either here again without a new reason.
     // INNER (intra-region) barrier: keep spinning on the team-local flag while
     // HOLDING the hart. The releaser's internal_release() is a plain atomic
     // store this spinner observes (wake ~ns, like vanilla); because we never
