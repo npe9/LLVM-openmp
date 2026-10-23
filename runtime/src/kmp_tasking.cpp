@@ -12,6 +12,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "kmp.h"
+#ifdef LIBOMP_USE_LITHE
+extern "C" int __kmp_lithe_inner_barrier_yield(kmp_info_t *th);
+#endif
 #include "kmp_i18n.h"
 #include "kmp_itt.h"
 #include "kmp_stats.h"
@@ -1653,6 +1656,26 @@ static kmp_int32 __kmpc_omp_taskwait_template(ident_t *loc_ref, kmp_int32 gtid,
         flag.execute_tasks(thread, gtid, FALSE,
                            &thread_finished USE_ITT_BUILD_ARG(itt_sync_obj),
                            __kmp_task_stealing_constraint);
+#ifdef LIBOMP_USE_LITHE
+        // B46 (2026-10-22): with nothing to steal, this loop held the hart
+        // forever. Contexts queued on that hart's run queue -- among them the one
+        // running the child this taskwait waits for -- were then served only by
+        // other harts' steals, which never came while their own queues held
+        // barrier spinners: 16 threads on 4 harts hung (a RUNNABLE context aged
+        // 6 s in one queue) in 5-15 % of runs. Donate the hart to a hartless
+        // peer, as the barrier waits do. LITHE_OMP_TASKWAIT_DONATE=0 restores
+        // the old spin.
+        {
+          static int tw_donate = -1;
+          if (tw_donate < 0) {
+            const char *e = getenv("LITHE_OMP_TASKWAIT_DONATE");
+            tw_donate = (e && *e) ? atoi(e) : 1;
+          }
+          if (tw_donate &&
+              KMP_ATOMIC_LD_ACQ(&taskdata->td_incomplete_child_tasks) != 0)
+            (void)__kmp_lithe_inner_barrier_yield(thread);
+        }
+#endif
       }
     }
 #if USE_ITT_BUILD
@@ -2523,7 +2546,25 @@ static inline int __kmp_execute_tasks_template(
         break;
       }
       // Yield before executing next task
+#ifdef LIBOMP_USE_LITHE
+      // NEGATIVE RESULT (2026-10-22): under Lithe this is a real context
+      // switch, and skipping it in a constrained wait (taskwait) looked like the
+      // cure for the residual oversubscribed-tasking hangs: it was not (2/40 vs
+      // 3/40). The cause was the taskwait loop never yielding (B46, below in
+      // __kmpc_omp_taskwait_template). LITHE_OMP_TASKWAIT_YIELD=0 skips this
+      // yield in constrained waits; default keeps it.
+      {
+        static int tw_yield = -1;
+        if (tw_yield < 0) {
+          const char *e = getenv("LITHE_OMP_TASKWAIT_YIELD");
+          tw_yield = (e && *e) ? atoi(e) : 1;
+        }
+        if (!is_constrained || tw_yield)
+          KMP_YIELD(__kmp_library == library_throughput);
+      }
+#else
       KMP_YIELD(__kmp_library == library_throughput);
+#endif
       // If execution of a stolen task results in more tasks being placed on our
       // run queue, reset use_own_tasks
       if (!use_own_tasks && TCR_4(threads_data[tid].td.td_deque_ntasks) != 0) {
