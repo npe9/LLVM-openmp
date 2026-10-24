@@ -5424,7 +5424,10 @@ void __kmp_free_team(kmp_root_t *root,
          * reach SAFE_TO_REAP if someone gives it a hart, so at harts == team
          * size the master can spin forever. LITHE_OMP_REAP_YIELD=1 makes it a
          * KMP_YIELD_SPIN (bounded pause, then __kmp_yield(1) -> Lithe yield).
-         * Default off until A/B'd. */
+         * Default off. NOT the omp_nested tail: 4x4 on 4 harts looked fixed at
+         * n=5 and the n=12 rerun refuted it (gated 3/12 slow, off 1/12); gdb
+         * shows this function runs once per run, at teardown -- nested inner
+         * teams are hot under Lithe. Reachable only for non-hot teams. */
         kmp_uint32 reap_spins;
         KMP_INIT_YIELD(reap_spins);
         const int reap_yield = __kmp_lithe_reap_yield_on();
