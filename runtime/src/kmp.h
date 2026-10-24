@@ -1098,6 +1098,7 @@ static void __kmp_x86_pause(void) { _mm_pause(); }
 
 #ifdef LIBOMP_USE_LITHE
 extern void __kmp_yield_release(int cond);
+extern "C" int __kmp_lithe_reap_yield_on(void);
 #endif
 #define KMP_YIELD(cond)                                                        \
   {                                                                            \

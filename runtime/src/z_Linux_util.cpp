@@ -274,6 +274,17 @@ static int __kmp_lithe_hart_limit(void) {
   return &parlib_vcore_limit ? parlib_vcore_limit() : (int)max_vcores();
 }
 
+/* LITHE_OMP_REAP_YIELD (default 0): __kmp_free_team's reap wait yields the hart
+ * via KMP_YIELD_SPIN instead of pure-pausing (kmp_runtime.cpp, GAPS B56). */
+extern "C" int __kmp_lithe_reap_yield_on(void) {
+  static int on = -1;
+  if (__builtin_expect(on < 0, 0)) {
+    const char *e = getenv("LITHE_OMP_REAP_YIELD");
+    on = (e && *e) ? atoi(e) != 0 : 0;
+  }
+  return on;
+}
+
 extern "C" int __kmp_lithe_fork_hot_ok(int nproc) {
   int hot = __kmp_lithe_hot_team;
   int reserve = __kmp_lithe_hot_reserve;

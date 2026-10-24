@@ -5417,6 +5417,18 @@ void __kmp_free_team(kmp_root_t *root,
         KMP_DEBUG_ASSERT(team->t.t_threads[f]);
         kmp_info_t *th = team->t.t_threads[f];
         volatile kmp_uint32 *state = &th->th.th_reap_state;
+#ifdef LIBOMP_USE_LITHE
+        /* REAP WAIT (GAPS B56 census, 2026-10-24): this was an unbounded pause
+         * loop holding the master's hart. A worker that is runnable but
+         * hartless (e.g. after its task-loop lithe_context_yield) can only
+         * reach SAFE_TO_REAP if someone gives it a hart, so at harts == team
+         * size the master can spin forever. LITHE_OMP_REAP_YIELD=1 makes it a
+         * KMP_YIELD_SPIN (bounded pause, then __kmp_yield(1) -> Lithe yield).
+         * Default off until A/B'd. */
+        kmp_uint32 reap_spins;
+        KMP_INIT_YIELD(reap_spins);
+        const int reap_yield = __kmp_lithe_reap_yield_on();
+#endif
         while (*state != KMP_SAFE_TO_REAP) {
 #if KMP_OS_WINDOWS
           // On Windows a thread can be killed at any time, check this
@@ -5430,6 +5442,12 @@ void __kmp_free_team(kmp_root_t *root,
           kmp_flag_64 fl(&th->th.th_bar[bs_forkjoin_barrier].bb.b_go, th);
           if (fl.is_sleeping())
             fl.resume(__kmp_gtid_from_thread(th));
+#ifdef LIBOMP_USE_LITHE
+          if (reap_yield) {
+            KMP_YIELD_SPIN(reap_spins);
+            continue;
+          }
+#endif
           KMP_CPU_PAUSE();
         }
       }
