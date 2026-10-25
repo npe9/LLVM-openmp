@@ -958,7 +958,7 @@ __kmp_init_indirect_csptr(kmp_critical_name *crit, ident_t const *loc,
       KMP_FSYNC_PREPARE(l);                                                    \
       KMP_INIT_YIELD(spins);                                                   \
       if (TCR_4(__kmp_nth) >                                                   \
-          (__kmp_avail_proc ? __kmp_avail_proc : __kmp_xproc)) {               \
+          KMP_OVERSUB_PROCS()) {               \
         KMP_YIELD(TRUE);                                                       \
       } else {                                                                 \
         KMP_YIELD_SPIN(spins);                                                 \
@@ -969,7 +969,7 @@ __kmp_init_indirect_csptr(kmp_critical_name *crit, ident_t const *loc,
           !__kmp_atomic_compare_store_acq(&l->lk.poll, tas_free, tas_busy)) {  \
         __kmp_spin_backoff(&backoff);                                          \
         if (TCR_4(__kmp_nth) >                                                 \
-            (__kmp_avail_proc ? __kmp_avail_proc : __kmp_xproc)) {             \
+            KMP_OVERSUB_PROCS()) {             \
           KMP_YIELD(TRUE);                                                     \
         } else {                                                               \
           KMP_YIELD_SPIN(spins);                                               \
@@ -1061,7 +1061,7 @@ __kmp_init_indirect_csptr(kmp_critical_name *crit, ident_t const *loc,
     }                                                                          \
     KMP_MB();                                                                  \
     KMP_YIELD(TCR_4(__kmp_nth) >                                               \
-              (__kmp_avail_proc ? __kmp_avail_proc : __kmp_xproc));            \
+              KMP_OVERSUB_PROCS());            \
   }
 
 #endif // KMP_USE_FUTEX
@@ -3988,6 +3988,14 @@ void __kmpc_doacross_wait(ident_t *loc, int gtid, long long *vec) {
   iter_number >>= 5; // divided by 32
   flag = 1 << shft;
   while ((flag & pr_buf->th_doacross_flags[iter_number]) == 0) {
+#ifdef LIBOMP_USE_LITHE
+    /* LITHE_OMP_DOACROSS_BLOCK (default 0, NEGATIVE -- z_Linux_util.cpp DE-SPIN):
+       block on a slot futex; __kmpc_doacross_post wakes it when a waiter exists. */
+    if (__kmp_lithe_doacross_block_on() && __kmp_lithe_may_block()) {
+      __kmp_lithe_dx_wait(&pr_buf->th_doacross_flags[iter_number], flag);
+      continue;
+    }
+#endif
     KMP_YIELD(TRUE);
   }
   KMP_MB();
@@ -4044,8 +4052,13 @@ void __kmpc_doacross_post(ident_t *loc, int gtid, long long *vec) {
   iter_number >>= 5; // divided by 32
   flag = 1 << shft;
   KMP_MB();
-  if ((flag & pr_buf->th_doacross_flags[iter_number]) == 0)
+  if ((flag & pr_buf->th_doacross_flags[iter_number]) == 0) {
     KMP_TEST_THEN_OR32(&pr_buf->th_doacross_flags[iter_number], flag);
+#ifdef LIBOMP_USE_LITHE
+    if (__kmp_lithe_doacross_block_on())
+      __kmp_lithe_dx_posted(&pr_buf->th_doacross_flags[iter_number]);
+#endif
+  }
   KA_TRACE(20, ("__kmpc_doacross_post() exit: T#%d iter %lld posted\n", gtid,
                 (iter_number << 5) + shft));
 }

@@ -6370,8 +6370,41 @@ static inline char *__kmp_reg_status_name() {
   return __kmp_str_format("__KMP_REGISTERED_LIB_%d", (int)getpid());
 } // __kmp_reg_status_get
 
+#ifdef LIBOMP_USE_LITHE
+/* LITHE_OMP_REG_EARLY (default 0, 2026-10-24): the duplicate-library
+ * registration setenv()s __KMP_REGISTERED_LIB_<pid> at serial init and
+ * unsetenv()s it at shutdown. In hosted mode those run while other rank
+ * contexts and helper threads call getenv(), and glibc setenv/unsetenv can
+ * realloc or shift environ under a reader: two hosted miniFE segfaults in
+ * getenv (.build_logs/despin/lithe/mfehunt/). With the gate, registration runs
+ * in a load-time constructor (before any Lithe context exists, for a library
+ * linked at startup) and the shutdown unsetenv is skipped (the variable names
+ * this pid, so leaving it is harmless). Duplicate-copy detection still works.
+ * Not measured for the crash rate yet: that needs the mfehunt reproducer. */
+static int __kmp_lithe_reg_done = 0;
+static int __kmp_lithe_reg_early(void) {
+  static int on = -1;
+  if (on < 0) {
+    const char *e = getenv("LITHE_OMP_REG_EARLY");
+    on = (e && *e) ? atoi(e) != 0 : 0;
+  }
+  return on;
+}
+void __kmp_register_library_startup(void);
+__attribute__((constructor)) static void __kmp_lithe_reg_ctor(void) {
+  if (__kmp_lithe_reg_early()) {
+    __kmp_register_library_startup();
+    __kmp_lithe_reg_done = 1;
+  }
+}
+#endif
+
 void __kmp_register_library_startup(void) {
 
+#ifdef LIBOMP_USE_LITHE
+  if (__kmp_lithe_reg_done)
+    return; /* LITHE_OMP_REG_EARLY: already registered by the constructor */
+#endif
   char *name = __kmp_reg_status_name(); // Name of the environment variable.
   int done = 0;
   union {
@@ -6473,6 +6506,9 @@ void __kmp_unregister_library(void) {
   KMP_DEBUG_ASSERT(__kmp_registration_str != NULL);
   if (value != NULL && strcmp(value, __kmp_registration_str) == 0) {
     // Ok, this is our variable. Delete it.
+#ifdef LIBOMP_USE_LITHE
+    if (!__kmp_lithe_reg_early()) /* no environ write while contexts run */
+#endif
     __kmp_env_unset(name);
   }
 
@@ -6482,6 +6518,9 @@ void __kmp_unregister_library(void) {
 
   __kmp_registration_flag = 0;
   __kmp_registration_str = NULL;
+#ifdef LIBOMP_USE_LITHE
+  __kmp_lithe_reg_done = 0; /* a re-initialisation registers normally */
+#endif
 
 } // __kmp_unregister_library
 

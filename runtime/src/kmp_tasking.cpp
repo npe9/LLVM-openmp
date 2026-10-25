@@ -3131,7 +3131,7 @@ void __kmp_wait_to_unref_task_teams(void) {
 
     // If we are oversubscribed, or have waited a bit (and library mode is
     // throughput), yield. Pause is in the following code.
-    KMP_YIELD(TCR_4(__kmp_nth) > __kmp_avail_proc);
+    KMP_YIELD(TCR_4(__kmp_nth) > KMP_OVERSUB_PROCS());
     KMP_YIELD_SPIN(spins); // Yields only if KMP_LIBRARY=throughput
   }
 }

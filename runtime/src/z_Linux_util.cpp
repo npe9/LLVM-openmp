@@ -285,6 +285,166 @@ extern "C" int __kmp_lithe_reap_yield_on(void) {
   return on;
 }
 
+/* ------------------------------------------------------------------------
+ * DE-SPIN (2026-10-24, .build_logs/spin_census/DESPIN_RULES.md). A waiter on a
+ * Lithe context should hold its hart only while doing useful work. Measured on
+ * cores 32-35, 4 harts, interleaved, .build_logs/despin/openmp/ (ab_libomp*.csv,
+ * ab_misc.csv; medians, n=5 unless noted):
+ *   LITHE_OMP_QLOCK_BLOCK     (default 1) queuing-lock waiters (omp critical,
+ *                             omp_set_lock: the default lock kind) block on
+ *                             their th_spin_here word; the releaser wakes them.
+ *                             With OVERSUB_HARTS, n=10: critical 8 thr 0.249 ->
+ *                             0.139 s, omp_lock 8 thr 0.185 -> 0.154; 4 thr
+ *                             0.055/0.056; rest parity or better (below).
+ *   LITHE_OMP_OVERSUB_HARTS   (default 1) "threads > procs" tests
+ *                             (KMP_OVERSUB_PROCS: TAS/ticket/queuing locks,
+ *                             wait_yield, dispatch, tasking) use the hart limit,
+ *                             not the OS cpuset, so waiters yield at once when
+ *                             threads outnumber harts. n=10 with QLOCK: tasks 8 thr
+ *                             0.083 -> 0.068 s, 16 thr 0.106 -> 0.088; ordered 8
+ *                             thr 16.0 -> 13.5 ms, 16 thr 16.4 -> 13.7; nested
+ *                             8x4 306 -> 294 us; region cost 4 thr 1.77/1.80 us,
+ *                             8 thr 5.90/5.89; doacross 8/16 thr 18.0/15.8,
+ *                             25.6/21.7 ms; B46 tasks 16 thr 0/20 hangs.
+ *   LITHE_OMP_NOSPIN          (default 0) bitmask, __kmp_wait_template:
+ *                             1 = inner barrier parks at once, 2 = fork/join
+ *                             barrier parks at once (no hot-team budget, no
+ *                             KMP_BLOCKTIME poll). NEGATIVE for bit 2: region
+ *                             cost 4 thr 1.77 -> 3.52 us (the hot spin bridges
+ *                             the re-fork; the demand block already parks as
+ *                             soon as a peer is hartless), 8 thr 5.83 -> 5.60;
+ *                             bit 1 neutral (inner barrier already donates);
+ *                             nested/lock/tasks unchanged. Kept as an A/B arm.
+ *   LITHE_OMP_DOACROSS_BLOCK  (default 0) __kmpc_doacross_wait blocks on a slot
+ *                             futex. NEGATIVE: chain 4/8/16 thr 15.1/15.3/20.6
+ *                             -> 16.5/17.8/22.2 ms. The base wait already yields
+ *                             every iteration (KMP_YIELD(TRUE)), which beats a
+ *                             park/wake per wait here; no hang without it.
+ *   LITHE_OMP_ORDERED_BLOCK   (default 0) `omp ordered` waits block on a slot
+ *                             futex. NEGATIVE: 4/8/16 thr 13.2/13.2/14.1 ->
+ *                             14.6/18.4/21.7 ms; OVERSUB_HARTS alone is the
+ *                             better fix (13.0/13.6 at 8/16).
+ * ------------------------------------------------------------------------ */
+static int __kmp_lithe_env_flag(const char *name, int dflt) {
+  const char *e = getenv(name);
+  return (e && *e) ? atoi(e) : dflt;
+}
+extern "C" int __kmp_lithe_nospin_mask(void) {
+  static int m = -1;
+  if (__builtin_expect(m < 0, 0))
+    m = __kmp_lithe_env_flag("LITHE_OMP_NOSPIN", 0);
+  return m;
+}
+extern "C" int __kmp_lithe_avail_procs(void) {
+  static int on = -1;
+  if (__builtin_expect(on < 0, 0))
+    on = __kmp_lithe_env_flag("LITHE_OMP_OVERSUB_HARTS", 1) != 0;
+  if (on) {
+    int h = __kmp_lithe_hart_limit();
+    if (h > 0)
+      return h;
+  }
+  return __kmp_avail_proc ? __kmp_avail_proc : __kmp_xproc;
+}
+extern "C" int __kmp_lithe_qlock_block_on(void) {
+  static int on = -1;
+  if (__builtin_expect(on < 0, 0))
+    on = __kmp_lithe_env_flag("LITHE_OMP_QLOCK_BLOCK", 1) != 0;
+  return on;
+}
+extern "C" int __kmp_lithe_doacross_block_on(void) {
+  static int on = -1;
+  if (__builtin_expect(on < 0, 0))
+    on = __kmp_lithe_env_flag("LITHE_OMP_DOACROSS_BLOCK", 0) != 0;
+  return on;
+}
+/* liblithe's futex emulation (src/lithe/src/futex.c): per-address wait queue,
+ * value re-checked under its lock inside lithe_context_block. */
+extern "C" int __kmp_lithe_futex_wait_(int *, int) __asm__("futex_wait")
+    __attribute__((weak));
+extern "C" int __kmp_lithe_futex_wake_some_(int *, int)
+    __asm__("futex_wake_some") __attribute__((weak));
+extern "C" int __kmp_lithe_may_block(void) {
+  return &__kmp_lithe_futex_wait_ != NULL && lithe_can_block();
+}
+/* Block until *w != busy. *parked is published before the re-check so the
+ * waker (store, full fence, load *parked) cannot miss us. */
+extern "C" void __kmp_lithe_word_block(volatile kmp_uint32 *w, kmp_uint32 busy,
+                                       volatile kmp_int32 *parked) {
+  __atomic_store_n(parked, 1, __ATOMIC_SEQ_CST);
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  while (__atomic_load_n(w, __ATOMIC_ACQUIRE) == busy)
+    __kmp_lithe_futex_wait_((int *)w, (int)busy);
+  __atomic_store_n(parked, 0, __ATOMIC_RELAXED);
+}
+extern "C" void __kmp_lithe_word_wake(volatile kmp_uint32 *w, int n) {
+  if (&__kmp_lithe_futex_wake_some_ != NULL)
+    __kmp_lithe_futex_wake_some_((int *)w, n);
+}
+/* Doacross: the futex words are a fixed table of 64 {seq, waiters} slots
+ * indexed by the awaited flags word's address, so the set of futex addresses
+ * is bounded (liblithe's futex keeps every address it has seen on one linear
+ * list that never shrinks, src/lithe/src/futex.c get_futex_list; a word per
+ * flags word made the Lithe libgomp equivalent quadratic). A post wakes its
+ * slot only when the slot has waiters (one load otherwise); a collision is a
+ * spurious wake. */
+struct kmp_lithe_dx_slot {
+  volatile kmp_int32 seq;
+  volatile kmp_int32 waiters;
+  char pad[56];
+};
+static struct kmp_lithe_dx_slot __kmp_lithe_dx_slots[64]
+    __attribute__((aligned(64)));
+static inline struct kmp_lithe_dx_slot *
+__kmp_lithe_dx_slot(volatile kmp_uint32 *w) {
+  uintptr_t h = (uintptr_t)w >> 2;
+  return &__kmp_lithe_dx_slots[(h ^ (h >> 6) ^ (h >> 12)) & 63];
+}
+/* Generic slot wait/wake for any word whose setter calls __kmp_lithe_slot_wake
+ * after its store: arm (waiters++, fence, read seq), re-check, sleep. */
+extern "C" kmp_int32 __kmp_lithe_slot_arm(volatile void *w) {
+  struct kmp_lithe_dx_slot *sl = __kmp_lithe_dx_slot((volatile kmp_uint32 *)w);
+  __atomic_add_fetch(&sl->waiters, 1, __ATOMIC_SEQ_CST);
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  return __atomic_load_n(&sl->seq, __ATOMIC_ACQUIRE);
+}
+extern "C" void __kmp_lithe_slot_disarm(volatile void *w) {
+  struct kmp_lithe_dx_slot *sl = __kmp_lithe_dx_slot((volatile kmp_uint32 *)w);
+  __atomic_sub_fetch(&sl->waiters, 1, __ATOMIC_RELAXED);
+}
+extern "C" void __kmp_lithe_slot_sleep(volatile void *w, kmp_int32 sq) {
+  struct kmp_lithe_dx_slot *sl = __kmp_lithe_dx_slot((volatile kmp_uint32 *)w);
+  __kmp_lithe_futex_wait_((int *)&sl->seq, (int)sq);
+  __atomic_sub_fetch(&sl->waiters, 1, __ATOMIC_RELAXED);
+}
+extern "C" void __kmp_lithe_slot_wake(volatile void *w) {
+  struct kmp_lithe_dx_slot *sl = __kmp_lithe_dx_slot((volatile kmp_uint32 *)w);
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+  if (__atomic_load_n(&sl->waiters, __ATOMIC_RELAXED) != 0) {
+    __atomic_add_fetch(&sl->seq, 1, __ATOMIC_RELEASE);
+    __kmp_lithe_word_wake((volatile kmp_uint32 *)&sl->seq, INT_MAX);
+  }
+}
+extern "C" void __kmp_lithe_dx_wait(volatile kmp_uint32 *w, kmp_uint32 bit) {
+  kmp_int32 sq = __kmp_lithe_slot_arm(w);
+  if (__atomic_load_n(w, __ATOMIC_ACQUIRE) & bit)
+    __kmp_lithe_slot_disarm(w);
+  else
+    __kmp_lithe_slot_sleep(w, sq);
+}
+extern "C" void __kmp_lithe_dx_posted(volatile kmp_uint32 *w) {
+  __kmp_lithe_slot_wake(w);
+}
+/* LITHE_OMP_ORDERED_BLOCK (default 0): `#pragma omp ordered` waiters block on
+ * the slot of sh->u.s.ordered_iteration (kmp_dispatch.h __kmp_lithe_ordered_wait);
+ * the three ordered_iteration increments wake it. */
+extern "C" int __kmp_lithe_ordered_block_on(void) {
+  static int on = -1;
+  if (__builtin_expect(on < 0, 0))
+    on = __kmp_lithe_env_flag("LITHE_OMP_ORDERED_BLOCK", 0) != 0;
+  return on;
+}
+
 extern "C" int __kmp_lithe_fork_hot_ok(int nproc) {
   int hot = __kmp_lithe_hot_team;
   int reserve = __kmp_lithe_hot_reserve;

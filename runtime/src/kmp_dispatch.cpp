@@ -1009,8 +1009,7 @@ static void __kmp_dispatch_finish(int gtid, ident_t *loc) {
       }
 #endif
 
-      __kmp_wait_yield<UT>(&sh->u.s.ordered_iteration, lower,
-                           __kmp_ge<UT> USE_ITT_BUILD_ARG(NULL));
+      KMP_ORDERED_WAIT(UT, &sh->u.s.ordered_iteration, lower);
       KMP_MB(); /* is this necessary? */
 #ifdef KMP_DEBUG
       {
@@ -1025,6 +1024,7 @@ static void __kmp_dispatch_finish(int gtid, ident_t *loc) {
 #endif
 
       test_then_inc<ST>((volatile ST *)&sh->u.s.ordered_iteration);
+      KMP_LITHE_ORDERED_POSTED(&sh->u.s.ordered_iteration);
     } // if
   } // if
   KD_TRACE(100, ("__kmp_dispatch_finish: T#%d returned\n", gtid));
@@ -1078,8 +1078,7 @@ static void __kmp_dispatch_finish_chunk(int gtid, ident_t *loc) {
       }
 #endif
 
-      __kmp_wait_yield<UT>(&sh->u.s.ordered_iteration, lower,
-                           __kmp_ge<UT> USE_ITT_BUILD_ARG(NULL));
+      KMP_ORDERED_WAIT(UT, &sh->u.s.ordered_iteration, lower);
 
       KMP_MB(); /* is this necessary? */
       KD_TRACE(1000, ("__kmp_dispatch_finish_chunk: T#%d resetting "
@@ -1103,6 +1102,7 @@ static void __kmp_dispatch_finish_chunk(int gtid, ident_t *loc) {
 #endif
 
       test_then_add<ST>((volatile ST *)&sh->u.s.ordered_iteration, inc);
+      KMP_LITHE_ORDERED_POSTED(&sh->u.s.ordered_iteration);
     }
     //        }
   }
@@ -2483,7 +2483,7 @@ __kmp_wait_yield_4(volatile kmp_uint32 *spinner, kmp_uint32 checker,
 
     /* if we have waited a bit, or are oversubscribed, yield */
     /* pause is in the following code */
-    KMP_YIELD(TCR_4(__kmp_nth) > __kmp_avail_proc);
+    KMP_YIELD(TCR_4(__kmp_nth) > KMP_OVERSUB_PROCS());
     KMP_YIELD_SPIN(spins);
   }
   KMP_FSYNC_SPIN_ACQUIRED(obj);
@@ -2507,7 +2507,7 @@ void __kmp_wait_yield_4_ptr(
     KMP_FSYNC_SPIN_PREPARE(obj);
     /* if we have waited a bit, or are oversubscribed, yield */
     /* pause is in the following code */
-    KMP_YIELD(TCR_4(__kmp_nth) > __kmp_avail_proc);
+    KMP_YIELD(TCR_4(__kmp_nth) > KMP_OVERSUB_PROCS());
     KMP_YIELD_SPIN(spins);
   }
   KMP_FSYNC_SPIN_ACQUIRED(obj);

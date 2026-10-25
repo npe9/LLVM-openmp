@@ -1099,6 +1099,21 @@ static void __kmp_x86_pause(void) { _mm_pause(); }
 #ifdef LIBOMP_USE_LITHE
 extern void __kmp_yield_release(int cond);
 extern "C" int __kmp_lithe_reap_yield_on(void);
+/* De-spin gates (2026-10-24, z_Linux_util.cpp "DE-SPIN"). */
+extern "C" int __kmp_lithe_avail_procs(void);       /* LITHE_OMP_OVERSUB_HARTS */
+extern "C" int __kmp_lithe_qlock_block_on(void);     /* LITHE_OMP_QLOCK_BLOCK */
+extern "C" int __kmp_lithe_doacross_block_on(void);  /* LITHE_OMP_DOACROSS_BLOCK */
+extern "C" int __kmp_lithe_may_block(void);
+extern "C" void __kmp_lithe_word_block(volatile kmp_uint32 *w, kmp_uint32 busy,
+                                       volatile kmp_int32 *parked);
+extern "C" void __kmp_lithe_word_wake(volatile kmp_uint32 *w, int n);
+extern "C" void __kmp_lithe_dx_wait(volatile kmp_uint32 *w, kmp_uint32 bit);
+extern "C" void __kmp_lithe_dx_posted(volatile kmp_uint32 *w);
+/* "more OpenMP threads than processors": under Lithe the processors are the
+   harts (parlib_vcore_limit), not the OS cpuset, when LITHE_OMP_OVERSUB_HARTS. */
+#define KMP_OVERSUB_PROCS() (__kmp_lithe_avail_procs())
+#else
+#define KMP_OVERSUB_PROCS() (__kmp_avail_proc ? __kmp_avail_proc : __kmp_xproc)
 #endif
 #define KMP_YIELD(cond)                                                        \
   {                                                                            \
@@ -2504,6 +2519,10 @@ typedef struct KMP_ALIGN_CACHE kmp_base_info {
 
   volatile kmp_uint32 th_spin_here; /* thread-local location for spinning */
   /* while awaiting queuing lock acquire */
+#ifdef LIBOMP_USE_LITHE
+  volatile kmp_int32 th_lithe_qwait; /* LITHE_OMP_QLOCK_BLOCK: parked on
+                                        th_spin_here (kmp_lock.cpp) */
+#endif
 
   volatile void *th_sleep_loc; // this points at a kmp_flag<T>
 

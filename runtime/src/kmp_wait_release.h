@@ -57,6 +57,8 @@ int __kmp_lithe_demand_block_on(void);
 long lithe_fork_join_current_runnable_count(void);
 long __kmp_lithe_hartless_peers(void); /* z_Linux_util.cpp, LITHE_OMP_IDLE_AWARE */
 int __kmp_lithe_flat_on(void); /* z_Linux_util.cpp, LITHE_OMP_FLAT */
+int __kmp_lithe_nospin_mask(void); /* z_Linux_util.cpp, LITHE_OMP_NOSPIN */
+int lithe_can_block(void);
 }
 #endif
 
@@ -217,6 +219,13 @@ __kmp_wait_template(kmp_info_t *this_thr, C *flag,
   int lithe_did_block = 0;
   int lithe_force_block = 0; // demand block: skip the blocktime poll this pass
   const int lithe_demand = __kmp_lithe_demand_block_on();
+  // LITHE_OMP_NOSPIN (default 0, NEGATIVE for bit 2 -- region cost 2x at 1:1;
+  // z_Linux_util.cpp DE-SPIN): bit 1 inner barrier, bit 2
+  // fork/join barrier: park at once (flag->suspend) instead of any hot spin.
+  // Not under an infinite blocktime (releasers then skip the resume) and only
+  // where suspend really blocks (lithe_can_block; otherwise it returns at once
+  // and this would be a spin anyway).
+  const int lithe_nospin = __kmp_lithe_nospin_mask();
   // FLAT MODE + KMP_BLOCKTIME=infinite is a hang (2026-10-16, docs/GAPS.md B15):
   // workers hot-spin on every hart forever while their masters sit RUNNABLE,
   // and demand block cannot help because the "infinite" early-continue below
@@ -466,7 +475,17 @@ final_spin=FALSE)
     // to sibling schedulers (MPI/PMIx/UCX progress). Composition is preserved
     // at this COARSE granularity, and the bound means this is NOT infinite
     // hart hoarding.
-    if (this_thr->th.th_lithe_barrier_inner) {
+    if (lithe_nospin &&
+        (lithe_nospin & (this_thr->th.th_lithe_barrier_inner ? 1 : 2)) &&
+        __kmp_dflt_blocktime != KMP_MAX_BLOCKTIME && lithe_can_block()) {
+      // Tasks may still be spawned into this team: the wait below cannot park
+      // (no wake on task push in this libomp), so keep the hart-donation
+      // liveness of the spin paths instead of a bare pause.
+      if (task_team != NULL && TCR_4(task_team->tt.tt_found_tasks))
+        (void)__kmp_lithe_inner_barrier_yield(this_thr);
+      lithe_force_block = 1;
+      lithe_did_block = 1;
+    } else if (this_thr->th.th_lithe_barrier_inner) {
       if (__kmp_lithe_inner_spin &&
           (__kmp_lithe_inner_spin_max == 0 ||
            ++lithe_inner_spins < __kmp_lithe_inner_spin_max)) {

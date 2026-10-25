@@ -100,7 +100,7 @@ __kmp_acquire_tas_lock_timed_template(kmp_tas_lock_t *lck, kmp_int32 gtid) {
   kmp_uint32 spins;
   KMP_FSYNC_PREPARE(lck);
   KMP_INIT_YIELD(spins);
-  if (TCR_4(__kmp_nth) > (__kmp_avail_proc ? __kmp_avail_proc : __kmp_xproc)) {
+  if (TCR_4(__kmp_nth) > KMP_OVERSUB_PROCS()) {
     KMP_YIELD(TRUE);
   } else {
     KMP_YIELD_SPIN(spins);
@@ -111,7 +111,7 @@ __kmp_acquire_tas_lock_timed_template(kmp_tas_lock_t *lck, kmp_int32 gtid) {
          !__kmp_atomic_compare_store_acq(&lck->lk.poll, tas_free, tas_busy)) {
     __kmp_spin_backoff(&backoff);
     if (TCR_4(__kmp_nth) >
-        (__kmp_avail_proc ? __kmp_avail_proc : __kmp_xproc)) {
+        KMP_OVERSUB_PROCS()) {
       KMP_YIELD(TRUE);
     } else {
       KMP_YIELD_SPIN(spins);
@@ -170,7 +170,7 @@ int __kmp_release_tas_lock(kmp_tas_lock_t *lck, kmp_int32 gtid) {
   KMP_MB(); /* Flush all pending memory write invalidates.  */
 
   KMP_YIELD(TCR_4(__kmp_nth) >
-            (__kmp_avail_proc ? __kmp_avail_proc : __kmp_xproc));
+            KMP_OVERSUB_PROCS());
   return KMP_LOCK_RELEASED;
 }
 
@@ -483,7 +483,7 @@ int __kmp_release_futex_lock(kmp_futex_lock_t *lck, kmp_int32 gtid) {
                   lck->lk.poll, gtid));
 
   KMP_YIELD(TCR_4(__kmp_nth) >
-            (__kmp_avail_proc ? __kmp_avail_proc : __kmp_xproc));
+            KMP_OVERSUB_PROCS());
   return KMP_LOCK_RELEASED;
 }
 
@@ -755,10 +755,10 @@ int __kmp_release_ticket_lock(kmp_ticket_lock_t *lck, kmp_int32 gtid) {
 #ifdef LIBOMP_USE_LITHE
   /* B43: no hart donation from a plain release (see __kmp_yield_release). */
   __kmp_yield_release(distance >
-            (kmp_uint32)(__kmp_avail_proc ? __kmp_avail_proc : __kmp_xproc));
+            (kmp_uint32)KMP_OVERSUB_PROCS());
 #else
   KMP_YIELD(distance >
-            (kmp_uint32)(__kmp_avail_proc ? __kmp_avail_proc : __kmp_xproc));
+            (kmp_uint32)KMP_OVERSUB_PROCS());
 #endif
   return KMP_LOCK_RELEASED;
 }
@@ -1288,6 +1288,16 @@ __kmp_acquire_queuing_lock_timed_template(kmp_queuing_lock_t *lck,
       /* ToDo: May want to consider using __kmp_wait_sleep  or something that
          sleeps for throughput only here. */
       KMP_MB();
+#ifdef LIBOMP_USE_LITHE
+      /* LITHE_OMP_QLOCK_BLOCK (default 1, numbers in z_Linux_util.cpp DE-SPIN): the queued waiter BLOCKS on its own
+         th_spin_here word (a Lithe futex) instead of KMP_WAIT_YIELD's pause +
+         __kmp_yield loop, and the releaser wakes it after clearing the word
+         (only if th_lithe_qwait says it parked). Callers that cannot block
+         (foreign pthreads, vcore context) keep the spin. */
+      if (__kmp_lithe_qlock_block_on() && __kmp_lithe_may_block())
+        __kmp_lithe_word_block(spin_here_p, TRUE, &this_thr->th.th_lithe_qwait);
+      else
+#endif
       KMP_WAIT_YIELD(spin_here_p, FALSE, KMP_EQ, lck);
 
 #ifdef DEBUG_QUEUING_LOCKS
@@ -1319,7 +1329,7 @@ __kmp_acquire_queuing_lock_timed_template(kmp_queuing_lock_t *lck,
     /* ToDo: Not sure why this should only be in oversubscription case,
        maybe should be traditional YIELD_INIT/YIELD_WHEN loop */
     KMP_YIELD(TCR_4(__kmp_nth) >
-              (__kmp_avail_proc ? __kmp_avail_proc : __kmp_xproc));
+              KMP_OVERSUB_PROCS());
 #ifdef DEBUG_QUEUING_LOCKS
     TRACE_LOCK(gtid + 1, "acq retry");
 #endif
@@ -1528,6 +1538,13 @@ int __kmp_release_queuing_lock(kmp_queuing_lock_t *lck, kmp_int32 gtid) {
       KMP_MB();
       /* reset spin value */
       head_thr->th.th_spin_here = FALSE;
+#ifdef LIBOMP_USE_LITHE
+      if (__kmp_lithe_qlock_block_on()) {
+        __atomic_thread_fence(__ATOMIC_SEQ_CST); /* vs the waiter's qwait store */
+        if (TCR_4(head_thr->th.th_lithe_qwait))
+          __kmp_lithe_word_wake(&head_thr->th.th_spin_here, 1);
+      }
+#endif
 
       KA_TRACE(1000, ("__kmp_release_queuing_lock: lck:%p, T#%d exiting: after "
                       "dequeuing\n",
@@ -2324,7 +2341,7 @@ __kmp_acquire_drdpa_lock_timed_template(kmp_drdpa_lock_t *lck, kmp_int32 gtid) {
     // CPU Pause is in the macros for yield.
     //
     KMP_YIELD(TCR_4(__kmp_nth) >
-              (__kmp_avail_proc ? __kmp_avail_proc : __kmp_xproc));
+              KMP_OVERSUB_PROCS());
     KMP_YIELD_SPIN(spins);
 
     // Re-read the mask and the poll pointer from the lock structure.
@@ -2364,7 +2381,7 @@ __kmp_acquire_drdpa_lock_timed_template(kmp_drdpa_lock_t *lck, kmp_int32 gtid) {
     kmp_uint32 num_polls = TCR_4(lck->lk.num_polls);
 
     if (TCR_4(__kmp_nth) >
-        (__kmp_avail_proc ? __kmp_avail_proc : __kmp_xproc)) {
+        KMP_OVERSUB_PROCS()) {
       // We are in oversubscription mode.  Contract the polling area
       // down to a single location, if that hasn't been done already.
       if (num_polls > 1) {
