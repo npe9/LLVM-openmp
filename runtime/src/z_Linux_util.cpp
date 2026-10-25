@@ -329,10 +329,21 @@ static int __kmp_lithe_env_flag(const char *name, int dflt) {
   const char *e = getenv(name);
   return (e && *e) ? atoi(e) : dflt;
 }
+/* GAPS B60 (2026-10-25): under LITHE_OMP_FLAT=0 each team runs in its own child
+ * scheduler and demand block is off (it reads the child's runnable count; the
+ * waiting masters are runnable in the PARENT). Workers at the fork barrier then
+ * hot-spin the whole blocktime on every hart while the other masters starve: two
+ * tenants of 4 threads on 4 harts "hung" (200 ms per region; KMP_BLOCKTIME=1 ->
+ * 2-3 ms rounds). Parking at the fork/join barrier at once (bit 2) is what
+ * libgomp's GOMP_LITHE_OWN_SCHED does by default, so nested mode now defaults to
+ * 2. With it, nested mode is the low-tail mode: cotenant 2x4 on 4 harts, n=6,
+ * p99 143 us vs flat 206, noise 0.0065 vs 0.035, mean at ideal (135.5);
+ * NOSPIN=2 under flat changes nothing (206). .build_logs/b60/ablate.txt. */
+extern "C" int __kmp_lithe_flat_on(void);
 extern "C" int __kmp_lithe_nospin_mask(void) {
   static int m = -1;
   if (__builtin_expect(m < 0, 0))
-    m = __kmp_lithe_env_flag("LITHE_OMP_NOSPIN", 0);
+    m = __kmp_lithe_env_flag("LITHE_OMP_NOSPIN", __kmp_lithe_flat_on() ? 0 : 2);
   return m;
 }
 extern "C" int __kmp_lithe_avail_procs(void) {
