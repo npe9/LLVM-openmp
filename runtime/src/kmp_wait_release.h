@@ -56,6 +56,7 @@ int __kmp_lithe_inner_barrier_yield(kmp_info_t *th);
 int __kmp_lithe_demand_block_on(void);
 long lithe_fork_join_current_runnable_count(void);
 long __kmp_lithe_hartless_peers(void); /* z_Linux_util.cpp, LITHE_OMP_IDLE_AWARE */
+int __kmp_lithe_elsewhere_poll(void); /* z_Linux_util.cpp, LITHE_OMP_ELSEWHERE */
 int __kmp_lithe_flat_on(void); /* z_Linux_util.cpp, LITHE_OMP_FLAT */
 int __kmp_lithe_nospin_mask(void); /* z_Linux_util.cpp, LITHE_OMP_NOSPIN */
 int lithe_can_block(void);
@@ -499,7 +500,11 @@ final_spin=FALSE)
         (void)__kmp_lithe_inner_barrier_yield(this_thr);
         continue;
       }
-    } else if (lithe_demand && __kmp_lithe_hartless_peers() > 0) {
+    } else if (lithe_demand && (__kmp_lithe_hartless_peers() > 0 ||
+                                __kmp_lithe_elsewhere_poll())) {
+      // (GAPS B61, LITHE_OMP_ELSEWHERE: also when a scheduler on the chain
+      // above this team's has unmet hart demand -- a co-tenant runtime or a
+      // sibling rank's team -- which the per-sched peer count cannot see.)
       // FORK/JOIN barrier, DEMAND BLOCK (LITHE_OMP_DEMAND_BLOCK): a peer on
       // this sched is RUNNABLE but has no hart -- in the hosted flat model
       // usually our own master, i.e. the logical MPI rank that has to reach

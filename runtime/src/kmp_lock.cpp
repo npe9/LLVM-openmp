@@ -19,6 +19,11 @@
 #include "kmp_io.h"
 #include "kmp_itt.h"
 #include "kmp_lock.h"
+#ifdef LIBOMP_USE_LITHE
+extern "C" int __kmp_lithe_lock_block_on(void);
+extern "C" void __kmp_lithe_ticket_wait(std::atomic_uint *now_serving, kmp_uint32 ticket);
+extern "C" void __kmp_lithe_ticket_wake(std::atomic_uint *now_serving);
+#endif
 #include "kmp_wait_release.h"
 
 #include "tsan_annotations.h"
@@ -667,6 +672,17 @@ __kmp_acquire_ticket_lock_timed_template(kmp_ticket_lock_t *lck,
                                 std::memory_order_acquire) == my_ticket) {
     return KMP_LOCK_ACQUIRED_FIRST;
   }
+#ifdef LIBOMP_USE_LITHE
+  /* GAPS B61 (2026-10-25): under Lithe a ticket-lock waiter BLOCKS its context (the hart
+   * returns to the scheduler) instead of spinning; the release wakes it. Spinning here
+   * livelocked hosted miniFE with nested libomp (4 ranks x 2 threads, 3 harts): a master
+   * spun on __kmp_forkjoin_lock while the holder sat hartless in another child scheduler,
+   * which the spinner's yield condition cannot see. LITHE_OMP_LOCK_BLOCK=0: old spin. */
+  if (__kmp_lithe_lock_block_on()) {
+    __kmp_lithe_ticket_wait(&lck->lk.now_serving, my_ticket);
+    return KMP_LOCK_ACQUIRED_FIRST;
+  }
+#endif
   KMP_WAIT_YIELD_PTR(&lck->lk.now_serving, my_ticket, __kmp_bakery_check, lck);
   return KMP_LOCK_ACQUIRED_FIRST;
 }
@@ -753,6 +769,7 @@ int __kmp_release_ticket_lock(kmp_ticket_lock_t *lck, kmp_int32 gtid) {
                                  std::memory_order_release);
 
 #ifdef LIBOMP_USE_LITHE
+  __kmp_lithe_ticket_wake(&lck->lk.now_serving); /* B61: only if a waiter is blocked */
   /* B43: no hart donation from a plain release (see __kmp_yield_release). */
   __kmp_yield_release(distance >
             (kmp_uint32)KMP_OVERSUB_PROCS());

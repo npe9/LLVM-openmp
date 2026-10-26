@@ -3989,8 +3989,9 @@ void __kmpc_doacross_wait(ident_t *loc, int gtid, long long *vec) {
   flag = 1 << shft;
   while ((flag & pr_buf->th_doacross_flags[iter_number]) == 0) {
 #ifdef LIBOMP_USE_LITHE
-    /* LITHE_OMP_DOACROSS_BLOCK (default 0, NEGATIVE -- z_Linux_util.cpp DE-SPIN):
-       block on a slot futex; __kmpc_doacross_post wakes it when a waiter exists. */
+    /* LITHE_OMP_DOACROSS_BLOCK (default 1, keyed slots since B61 -- z_Linux_util.cpp
+       DE-SPIN): block on a futex slot keyed by (word, bit); __kmpc_doacross_post
+       wakes that slot when a waiter exists. */
     if (__kmp_lithe_doacross_block_on() && __kmp_lithe_may_block()) {
       __kmp_lithe_dx_wait(&pr_buf->th_doacross_flags[iter_number], flag);
       continue;
@@ -4056,7 +4057,7 @@ void __kmpc_doacross_post(ident_t *loc, int gtid, long long *vec) {
     KMP_TEST_THEN_OR32(&pr_buf->th_doacross_flags[iter_number], flag);
 #ifdef LIBOMP_USE_LITHE
     if (__kmp_lithe_doacross_block_on())
-      __kmp_lithe_dx_posted(&pr_buf->th_doacross_flags[iter_number]);
+      __kmp_lithe_dx_posted(&pr_buf->th_doacross_flags[iter_number], flag);
 #endif
   }
   KA_TRACE(20, ("__kmpc_doacross_post() exit: T#%d iter %lld posted\n", gtid,

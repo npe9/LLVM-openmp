@@ -1108,7 +1108,13 @@ extern "C" void __kmp_lithe_word_block(volatile kmp_uint32 *w, kmp_uint32 busy,
                                        volatile kmp_int32 *parked);
 extern "C" void __kmp_lithe_word_wake(volatile kmp_uint32 *w, int n);
 extern "C" void __kmp_lithe_dx_wait(volatile kmp_uint32 *w, kmp_uint32 bit);
-extern "C" void __kmp_lithe_dx_posted(volatile kmp_uint32 *w);
+extern "C" void __kmp_lithe_dx_posted(volatile kmp_uint32 *w, kmp_uint32 bit);
+extern "C" kmp_int32 __kmp_lithe_kslot_arm(volatile void *w, kmp_uint32 key);
+extern "C" void __kmp_lithe_kslot_disarm(volatile void *w, kmp_uint32 key);
+extern "C" void __kmp_lithe_kslot_sleep(volatile void *w, kmp_uint32 key, kmp_int32 sq);
+extern "C" void __kmp_lithe_kslot_wake(volatile void *w, kmp_uint32 key);
+extern "C" void __kmp_lithe_kslot_wake_range(volatile void *w, kmp_uint64 from, kmp_uint64 to);
+extern "C" int __kmp_lithe_ordered_block_on(void);
 /* "more OpenMP threads than processors": under Lithe the processors are the
    harts (parlib_vcore_limit), not the OS cpuset, when LITHE_OMP_OVERSUB_HARTS. */
 #define KMP_OVERSUB_PROCS() (__kmp_lithe_avail_procs())

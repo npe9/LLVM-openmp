@@ -1023,8 +1023,9 @@ static void __kmp_dispatch_finish(int gtid, ident_t *loc) {
       }
 #endif
 
-      test_then_inc<ST>((volatile ST *)&sh->u.s.ordered_iteration);
-      KMP_LITHE_ORDERED_POSTED(&sh->u.s.ordered_iteration);
+      UT _old = (UT)test_then_inc<ST>((volatile ST *)&sh->u.s.ordered_iteration);
+      KMP_LITHE_ORDERED_POSTED(&sh->u.s.ordered_iteration, _old, (UT)(_old + 1));
+      (void)_old;
     } // if
   } // if
   KD_TRACE(100, ("__kmp_dispatch_finish: T#%d returned\n", gtid));
@@ -1101,8 +1102,9 @@ static void __kmp_dispatch_finish_chunk(int gtid, ident_t *loc) {
       }
 #endif
 
-      test_then_add<ST>((volatile ST *)&sh->u.s.ordered_iteration, inc);
-      KMP_LITHE_ORDERED_POSTED(&sh->u.s.ordered_iteration);
+      UT _old = (UT)test_then_add<ST>((volatile ST *)&sh->u.s.ordered_iteration, inc);
+      KMP_LITHE_ORDERED_POSTED(&sh->u.s.ordered_iteration, _old, (UT)(_old + inc));
+      (void)_old;
     }
     //        }
   }

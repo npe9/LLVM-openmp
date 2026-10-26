@@ -727,6 +727,22 @@ void __kmp_parallel_deo(int *gtid_ref, int *cid_ref, ident_t *loc_ref) {
 #ifdef BUILD_PARALLEL_ORDERED
   if (!team->t.t_serialized) {
     KMP_MB();
+#ifdef LIBOMP_USE_LITHE
+    /* LITHE_OMP_ORDERED_BLOCK: wait for our turn on a slot keyed by our tid;
+       __kmp_parallel_dxo wakes the key it hands the turn to (GAPS B61). */
+    if (__kmp_lithe_ordered_block_on() && __kmp_lithe_may_block()) {
+      volatile kmp_uint32 *tv = &team->t.t_ordered.dt.t_value;
+      kmp_uint32 me = (kmp_uint32)__kmp_tid_from_gtid(gtid);
+      while (TCR_4(*tv) != me) {
+        kmp_int32 sq = __kmp_lithe_kslot_arm(tv, me);
+        if (TCR_4(*tv) == me) {
+          __kmp_lithe_kslot_disarm(tv, me);
+          break;
+        }
+        __kmp_lithe_kslot_sleep(tv, me, sq);
+      }
+    } else
+#endif
     KMP_WAIT_YIELD(&team->t.t_ordered.dt.t_value, __kmp_tid_from_gtid(gtid),
                    KMP_EQ, NULL);
     KMP_MB();
@@ -753,6 +769,11 @@ void __kmp_parallel_dxo(int *gtid_ref, int *cid_ref, ident_t *loc_ref) {
     /* use the tid of the next thread in this team */
     /* TODO replace with general release procedure */
     team->t.t_ordered.dt.t_value = ((tid + 1) % team->t.t_nproc);
+#ifdef LIBOMP_USE_LITHE
+    if (__kmp_lithe_ordered_block_on())
+      __kmp_lithe_kslot_wake(&team->t.t_ordered.dt.t_value,
+                             (kmp_uint32)((tid + 1) % team->t.t_nproc));
+#endif
 
     KMP_MB(); /* Flush all pending memory write invalidates.  */
   }

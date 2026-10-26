@@ -328,7 +328,7 @@ static UT __kmp_wait_yield(volatile UT *spinner, UT checker,
 }
 
 #ifdef LIBOMP_USE_LITHE
-/* LITHE_OMP_ORDERED_BLOCK (default 0, NEGATIVE: z_Linux_util.cpp DE-SPIN): the ordered-section wait blocks
+/* LITHE_OMP_ORDERED_BLOCK (default 1, keyed since B61: z_Linux_util.cpp DE-SPIN): the ordered-section wait blocks
    on a Lithe futex slot instead of __kmp_wait_yield's pause + yield loop; the
    ordered_iteration increments (KMP_LITHE_ORDERED_POSTED) wake it. Callers
    that cannot block keep the spin. */
@@ -341,26 +341,27 @@ template <typename UT>
 static void __kmp_lithe_ordered_wait(volatile UT *spin, UT check,
                                      kmp_uint32 (*f)(UT, UT)) {
   if (__kmp_lithe_ordered_block_on() && __kmp_lithe_may_block()) {
+    /* keyed on the awaited value: only the post that reaches it wakes us */
     while (!f(*spin, check)) {
-      kmp_int32 sq = __kmp_lithe_slot_arm(spin);
+      kmp_int32 sq = __kmp_lithe_kslot_arm(spin, (kmp_uint32)check);
       if (f(*spin, check)) {
-        __kmp_lithe_slot_disarm(spin);
+        __kmp_lithe_kslot_disarm(spin, (kmp_uint32)check);
         break;
       }
-      __kmp_lithe_slot_sleep(spin, sq);
+      __kmp_lithe_kslot_sleep(spin, (kmp_uint32)check, sq);
     }
     return;
   }
   __kmp_wait_yield<UT>(spin, check, f USE_ITT_BUILD_ARG(NULL));
 }
-#define KMP_LITHE_ORDERED_POSTED(p)                                            \
+#define KMP_LITHE_ORDERED_POSTED(p, from, to)                                  \
   do {                                                                         \
     if (__kmp_lithe_ordered_block_on())                                        \
-      __kmp_lithe_slot_wake(p);                                                \
+      __kmp_lithe_kslot_wake_range((p), (kmp_uint64)(from), (kmp_uint64)(to)); \
   } while (0)
 #define KMP_ORDERED_WAIT(UT, p, chk) __kmp_lithe_ordered_wait<UT>((p), (chk), __kmp_ge<UT>)
 #else
-#define KMP_LITHE_ORDERED_POSTED(p) ((void)0)
+#define KMP_LITHE_ORDERED_POSTED(p, from, to) ((void)0)
 #define KMP_ORDERED_WAIT(UT, p, chk)                                           \
   __kmp_wait_yield<UT>((p), (chk), __kmp_ge<UT> USE_ITT_BUILD_ARG(NULL))
 #endif
@@ -496,8 +497,9 @@ void __kmp_dispatch_dxo(int *gtid_ref, int *cid_ref, ident_t *loc_ref) {
     KMP_MB(); /* Flush all pending memory write invalidates.  */
 
     /* TODO use general release procedure? */
-    test_then_inc<ST>((volatile ST *)&sh->u.s.ordered_iteration);
-    KMP_LITHE_ORDERED_POSTED(&sh->u.s.ordered_iteration);
+    UT _old = (UT)test_then_inc<ST>((volatile ST *)&sh->u.s.ordered_iteration);
+    KMP_LITHE_ORDERED_POSTED(&sh->u.s.ordered_iteration, _old, (UT)(_old + 1));
+    (void)_old;
 
     KMP_MB(); /* Flush all pending memory write invalidates.  */
   }
