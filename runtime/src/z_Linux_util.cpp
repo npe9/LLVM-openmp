@@ -306,7 +306,8 @@ extern "C" int __kmp_lithe_reap_yield_on(void) {
  *                             8x4 306 -> 294 us; region cost 4 thr 1.77/1.80 us,
  *                             8 thr 5.90/5.89; doacross 8/16 thr 18.0/15.8,
  *                             25.6/21.7 ms; B46 tasks 16 thr 0/20 hangs.
- *   LITHE_OMP_NOSPIN          (default 0) bitmask, __kmp_wait_template:
+ *   LITHE_OMP_NOSPIN          (default 2 since 2026-10-26, GAPS B62; was 0 flat,
+ *                             2 nested) bitmask, __kmp_wait_template:
  *                             1 = inner barrier parks at once, 2 = fork/join
  *                             barrier parks at once (no hot-team budget, no
  *                             KMP_BLOCKTIME poll). NEGATIVE for bit 2: region
@@ -314,7 +315,16 @@ extern "C" int __kmp_lithe_reap_yield_on(void) {
  *                             the re-fork; the demand block already parks as
  *                             soon as a peer is hartless), 8 thr 5.83 -> 5.60;
  *                             bit 1 neutral (inner barrier already donates);
- *                             nested/lock/tasks unchanged. Kept as an A/B arm.
+ *                             nested/lock/tasks unchanged.
+ *                             FLIPPED to 2 (2026-10-26, user rule "libomp should
+ *                             not spin, it should block and release the
+ *                             scheduler"): only that microbenchmark pays. 7 HPDC
+ *                             apps x bal/over x lith/ompl, n=5 (n=10 LULESH,
+ *                             XSBench): 0.974-1.013; flat cotenant / hosted mfe /
+ *                             ranks8 n=10 parity; FTQ/FWQ probe on a spare hart:
+ *                             no added noise (lost 1.1 %, noise 0.9 %, = floor),
+ *                             region p50 within 2 us of NOSPIN=0, CPU/wall at
+ *                             100 us gaps 3.57 -> 2.96. =0 restores the spin.
  *   LITHE_OMP_DOACROSS_BLOCK  (default 1 since B61) __kmpc_doacross_wait blocks
  *                             on a futex slot keyed by (flags word, bit). Was
  *                             NEGATIVE with address-only slots (every post woke
@@ -348,7 +358,7 @@ extern "C" int __kmp_lithe_flat_on(void);
 extern "C" int __kmp_lithe_nospin_mask(void) {
   static int m = -1;
   if (__builtin_expect(m < 0, 0))
-    m = __kmp_lithe_env_flag("LITHE_OMP_NOSPIN", __kmp_lithe_flat_on() ? 0 : 2);
+    m = __kmp_lithe_env_flag("LITHE_OMP_NOSPIN", 2);
   return m;
 }
 extern "C" int __kmp_lithe_avail_procs(void) {

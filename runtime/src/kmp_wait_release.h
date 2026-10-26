@@ -220,7 +220,8 @@ __kmp_wait_template(kmp_info_t *this_thr, C *flag,
   int lithe_did_block = 0;
   int lithe_force_block = 0; // demand block: skip the blocktime poll this pass
   const int lithe_demand = __kmp_lithe_demand_block_on();
-  // LITHE_OMP_NOSPIN (default 0, NEGATIVE for bit 2 -- region cost 2x at 1:1;
+  // LITHE_OMP_NOSPIN (default 2 since GAPS B62; bit 2 costs the region-cost
+  // microbenchmark 2x at 1:1 and the apps nothing;
   // z_Linux_util.cpp DE-SPIN): bit 1 inner barrier, bit 2
   // fork/join barrier: park at once (flag->suspend) instead of any hot spin.
   // Not under an infinite blocktime (releasers then skip the resume) and only
