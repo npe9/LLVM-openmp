@@ -361,6 +361,45 @@ extern "C" int __kmp_lithe_nospin_mask(void) {
     m = __kmp_lithe_env_flag("LITHE_OMP_NOSPIN", 2);
   return m;
 }
+/* LITHE_OMP_BAR_FLAT (2026-10-27, default 1 = fork/join only; bit 1 = fork/join barrier,
+ * bit 2 = plain and reduction barriers too). When workers block at the fork/join
+ * barrier (NOSPIN bit 2), every level of the default hyper tree (branch 4) is one
+ * more block -> wake -> dispatch hop, about 2 us each: LULESH T=8 fork -> last
+ * worker 4.8 us vs 0.7 spinning. A linear gather/release is one hop, and the
+ * release already batches the team wake into one hart request (CHANGE 2).
+ * LULESH 8 threads on 8 harts, one chiplet: 2790 -> 3600 z/s (n=3); a chiplet
+ * hierarchy (KMP_*_BARRIER_PATTERN=hier) adds a hop and stays at 2810.
+ * Oversubscribed (team > harts) a linear gather made LULESH T=16 on 8 harts 4-6 %
+ * slower, so it applies only when the initial team (OMP_NUM_THREADS, else one per
+ * hart) fits on the hart limit; bit 4 forces it anyway.
+ * An explicit KMP_<type>_BARRIER[_PATTERN] setting wins. */
+extern "C" void __kmp_lithe_barrier_defaults(void) {
+  int m = __kmp_lithe_env_flag("LITHE_OMP_BAR_FLAT", 1);
+  if (!m || !(__kmp_lithe_nospin_mask() & 2))
+    return;
+  if (!(m & 4)) {
+    /* Only where the tree has more than one level: at 4 threads (branch 4) it is
+     * already one hop, and linear measured 0-11 % slower there (LULESH T=4,
+     * rc4 +3-5 %, n=10). */
+    const char *e = getenv("OMP_NUM_THREADS");
+    int team = (e && *e) ? atoi(e) : 0, harts = __kmp_lithe_hart_limit();
+    if (team <= 0)
+      team = harts;
+    if (harts > 0 && team > harts)
+      return;
+    if (team <= (1 << __kmp_barrier_gather_branch_bits[bs_forkjoin_barrier]))
+      return;
+  }
+  for (int i = 0; i < bs_last_barrier; i++) {
+    if (!(m & (i == bs_forkjoin_barrier ? 1 : 2)))
+      continue;
+    if (getenv(__kmp_barrier_pattern_env_name[i]) ||
+        getenv(__kmp_barrier_branch_bit_env_name[i]))
+      continue;
+    __kmp_barrier_gather_pattern[i] = bp_linear_bar;
+    __kmp_barrier_release_pattern[i] = bp_linear_bar;
+  }
+}
 extern "C" int __kmp_lithe_avail_procs(void) {
   static int on = -1;
   if (__builtin_expect(on < 0, 0))

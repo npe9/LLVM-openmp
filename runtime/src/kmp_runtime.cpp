@@ -12,6 +12,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "kmp.h"
+#ifdef LIBOMP_USE_LITHE
+extern "C" void __kmp_lithe_barrier_defaults(void); /* z_Linux_util.cpp */
+#endif
 
 #ifdef LIBOMP_USE_LITHE
 #include <lithe/sched_trace.h>
@@ -6750,6 +6753,9 @@ static void __kmp_do_serial_initialize(void) {
   __kmp_global.g.g_dynamic_mode = dynamic_default;
 
   __kmp_env_initialize(NULL);
+#ifdef LIBOMP_USE_LITHE
+  __kmp_lithe_barrier_defaults();
+#endif
 
 // Print all messages in message catalog for testing purposes.
 #ifdef KMP_DEBUG
